@@ -28,6 +28,7 @@ import threading
 _logger = logging.getLogger(__name__)
 import time
 import uuid
+from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -37,6 +38,7 @@ from async_scraper import (
     run_scraper_sync,
     _load_sitemap_seeds,
     load_checkpoint_rows_ignore_fingerprint,
+    load_rows_for_mid_scrape_analysis,
     get_scraper_sitemap_seeds,
     get_checkpoint_recovery_status,
 )
@@ -88,7 +90,9 @@ from utils.db_manager import (init_db, log_event, log_decision,
                                init_db_v26, upsert_our_catalog, upsert_comp_catalog,
                                merged_comp_dfs_for_analysis, load_all_comp_catalog_as_comp_dfs,
                                save_processed, get_processed, undo_processed,
-                               get_processed_keys, migrate_db_v26)
+                               get_processed_keys, migrate_db_v26,
+                               reset_application_session_storage,
+                               clear_app_persistent_logs)
 
 
 def _ui_autorefresh_interval(ms_default: int) -> int:
@@ -241,6 +245,93 @@ _LIVE_SESSION_PKL = os.path.join("data", "live_session_results.pkl")
 # خيط التحليل يكتب اللقطة بشكل متكرر؛ القفل + كتابة ذرية تمنع تداخل الكتابات وملفات تالفة
 _LIVE_SESSION_PKL_LOCK = threading.Lock()
 _CHECKPOINT_SORT_BG_LOCK = threading.Lock()
+
+# ─── REAL-TIME ANALYSIS ENGINE (v26.0) ───
+import queue as _queue
+import engines.scrape_event as _scrape_event
+
+_REALTIME_EV_QUEUE = _queue.Queue()
+_REALTIME_RESULTS_LOCK = threading.Lock()
+
+def _on_realtime_scrape_callback(ev: dict):
+    """خُطّاف يُنفَّذ من خيط الكشط الخلفي لكل منتج جديد."""
+    _REALTIME_EV_QUEUE.put(ev)
+
+# تسجيل الخُطّاف ليقوم السكربر بتغذية الطابور فوراً
+_scrape_event.register_realtime_hook(_on_realtime_scrape_callback)
+
+def _process_realtime_queue_main_thread():
+    """يُفرغ الطابور ويُحلل المنتجات واحداً بواحد في خيط الواجهة (تحديث حي)."""
+    if _REALTIME_EV_QUEUE.empty():
+        return
+    
+    our_df = st.session_state.get("our_df")
+    if our_df is None or our_df.empty:
+        # محاولة التحميل من الملف الافتراضي
+        our_path = os.path.join("data", "mahwous_catalog.csv")
+        if os.path.isfile(our_path):
+            try:
+                our_df = pd.read_csv(our_path)
+                st.session_state.our_df = our_df
+            except: pass
+    
+    if our_df is None or our_df.empty:
+        return
+
+    # معالجة لغاية 5 أحداث في كل rerun لتجنب تجميد الواجهة
+    processed = 0
+    while not _REALTIME_EV_QUEUE.empty() and processed < 5:
+        ev = _REALTIME_EV_QUEUE.get_nowait()
+        processed += 1
+        
+        try:
+            rp = ev.get("raw_product", {})
+            comp_name = str(rp.get("name", "")).strip()
+            comp_price = float(rp.get("price_sar", 0))
+            if not comp_name: continue
+            
+            # بناء DataFrame لصف واحد للمطابقة
+            cdf = pd.DataFrame([{
+                "اسم المنتج": comp_name,
+                "السعر": comp_price,
+                "رقم المنتج": str(rp.get("product_sku", "")),
+                "رابط_الصورة": str(rp.get("image_url", "")),
+                "رابط_الصفحة": str(ev.get("source_url", "")),
+                "المنافس": str(ev.get("competitor_id", "Competitor"))
+            }])
+            
+            # محاكاة comp_dfs للمحرك
+            comp_dfs = {ev.get("competitor_id", "Competitor"): cdf}
+            
+            # تشغيل التحليل الفوري (No-AI أولاً للسرعة)
+            res_df = run_full_analysis(our_df, comp_dfs, use_ai=False)
+            
+            if not res_df.empty:
+                # تحديث الـ analysis_df في الجلسة
+                with _REALTIME_RESULTS_LOCK:
+                    adf = st.session_state.get("analysis_df")
+                    if adf is None: adf = pd.DataFrame()
+                    
+                    # تجنب تكرار نفس المنتج لنفس المنافس في نفس الجلسة
+                    if not adf.empty:
+                        mask = (adf["المنتج"].astype(str) == res_df.iloc[0].get("المنتج")) & \
+                               (adf["منتج_المنافس"].astype(str) == comp_name)
+                        if mask.any(): continue
+                    
+                    new_adf = pd.concat([adf, res_df], ignore_index=True)
+                    st.session_state.analysis_df = new_adf
+                    
+                    # إعادة توزيع الأقسام
+                    r = _split_results(new_adf)
+                    # الحفاظ على المفقودات الحالية
+                    prev_r = st.session_state.get("results") or {}
+                    if prev_r.get("missing") is not None:
+                        r["missing"] = prev_r["missing"]
+                    st.session_state.results = r
+        except Exception:
+            _logger.exception("realtime processing of row failed")
+        finally:
+            _REALTIME_EV_QUEUE.task_done()
 
 
 def _default_checkpoint_sort() -> dict:
@@ -423,6 +514,21 @@ def _clear_live_session_pkl():
                 os.remove(_tmp)
     except Exception:
         pass
+
+
+def _reset_streamlit_after_storage_reset():
+    """بعد تصفير القرص/قاعدة البيانات — إفراغ نتائج التحليل في الجلسة دون مسح الكتالوج."""
+    st.session_state.results = None
+    st.session_state.missing_df = None
+    st.session_state.analysis_df = None
+    st.session_state.chat_history = []
+    st.session_state.job_id = None
+    st.session_state.job_running = False
+    st.session_state.decisions_pending = {}
+    st.session_state.our_df = None
+    st.session_state.comp_dfs = None
+    st.session_state.hidden_products = get_hidden_product_keys()
+    st.session_state.pop("api_diag_summary", None)
 
 
 # ════════════════════════════════════════════════
@@ -1264,38 +1370,44 @@ def _render_live_scrape_dashboard(snap: dict):
     c2.metric("🟢 سعر أقل", int(counts.get("price_lower", 0)))
     c3.metric("✅ موافق عليها", int(counts.get("approved", 0)))
     c4.metric("🔍 منتجات مفقودة", int(counts.get("missing", 0)))
-    c5.metric("⚠️ تحت المراجعة", int(counts.get("review", 0)))
+    with c5:
+            st.metric("⚠️ تحت المراجعة", int(counts.get("review", 0)))
+            if int(counts.get("review", 0)) > 0:
+                if st.button("🗑️ حذف النتائج الوهمية", key="del_fake_res_btn", help="تجاهل جميع المنتجات تحت المراجعة دفعة واحدة", use_container_width=True):
+                    mask = st.session_state.analysis_df['suggested_action'] == 'review'
+                    st.session_state.analysis_df.loc[mask, 'status'] = 'ignored'
+                    st.session_state.analysis_df.loc[mask, 'suggested_action'] = 'ignored'
+                    st.rerun()
     try:
-        _pe = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100") or 100)
+        _pe = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "3") or 3)
     except ValueError:
-        _pe = 100
-    if _pe <= 0:
-        _pe = 100
+        _pe = 3
+    _pe_hint = "معطّل (0)" if _pe <= 0 else f"كل {_pe} صف"
     try:
-        _n_ck_disk = int(get_checkpoint_recovery_status().get("raw_row_count") or 0)
+        _n_sortable = len(load_rows_for_mid_scrape_analysis())
     except Exception:
-        _n_ck_disk = 0
+        _n_sortable = 0
     st.caption(
-        f"**🔴🟢…** تُحدَّث آلياً كل **~{_pe}** صف منتج في النقطة (وليس مع كل رابط كشط). "
-        f"عدد «صفوف مكسوبة» قد يتقدّم على آخر فرز — اضغط الزر لفرز **كل** "
-        f"**{_n_ck_disk:,}** صف محفوظ الآن وتحديث العدادات (المتبقي)."
+        f"**🔴🟢…** المسار المترافق: **`SCRAPER_PIPELINE_EVERY`** = {_pe_hint} — افتراضي **3** "
+        f"(مستقر مع كتالوج كبير؛ اضبط **1** في البيئة لتحديث أشد؛ الطابور يُدمَج لأحدث صفوف). "
+        f"صفوف جاهزة للفرز اليدوي: **{_n_sortable:,}** (نقطة الحفظ أو `competitors_latest.csv`)."
     )
     _flush = st.button(
-        "🔄 تحديث الفرز لكل الصفوف في النقطة الآن (المتبقي)",
+        "⚡ تحليل الآن (دون إيقاف الكشط)",
         key="btn_live_flush_full_checkpoint",
-        disabled=_n_ck_disk == 0,
-        help="يشغّل المطابقة على كل صفوف scraper_checkpoint.json فوراً دون انتظار الدفعة التالية.",
+        disabled=_n_sortable == 0,
+        help="فرز مطابقة على كل المنتجات المكسوبة حتى الآن؛ الكشط يستمر في الخلفية.",
         use_container_width=True,
     )
     if _flush:
         ok, err = _start_checkpoint_sort_background(log_action="live_flush_sort")
         if not ok:
-            st.error(f"❌ {err}")
+            st.session_state["_checkpoint_sort_user_flash"] = (False, f"❌ {err}")
         else:
-            st.success(
-                f"✅ **بدأ** فرز **{_n_ck_disk:,}** صف في الخلفية — راقب التقدم في الشريط الجانبي والعدادات."
+            st.session_state["_checkpoint_sort_user_flash"] = (
+                True,
+                f"✅ **بدأ** فرز **{_n_sortable:,}** صف في الخلفية — راقب الشريط الجانبي والعدادات.",
             )
-            st.rerun()
     st.caption(
         "طابور عدة متاجر: قد تتأخر بعض الأقسام حتى اكتمال المتاجر. الجولة النهائية والـ Job من الشريط الجانبي."
     )
@@ -1346,12 +1458,12 @@ def _run_checkpoint_sort_pipeline(
     `update_session_state=False` للخيط الخلفي — يكتب pickle ويضع pending_hydrate.
     """
     try:
-        ck_rows = load_checkpoint_rows_ignore_fingerprint()
+        ck_rows = load_rows_for_mid_scrape_analysis()
     except Exception as e:
-        return False, f"قراءة النقطة: {e}", 0
+        return False, f"قراءة صفوف المنافس: {e}", 0
     n_ck = len(ck_rows)
     if n_ck == 0:
-        return False, "لا توجد صفوف في نقطة الحفظ بعد.", 0
+        return False, "لا توجد صفوف مكسوبة بعد (انتظر دفعة أو تحقق من competitors_latest.csv).", 0
     our_path = os.path.join("data", "mahwous_catalog.csv")
     if not os.path.isfile(our_path):
         return False, "لا يوجد `data/mahwous_catalog.csv` — ارفع الكتالوج أولاً.", 0
@@ -1498,11 +1610,11 @@ def _start_checkpoint_sort_background(*, log_action: str) -> tuple[bool, str]:
     if ck0.get("active"):
         return False, "يوجد بالفعل فرز من نقطة الحفظ قيد التنفيذ — انتظر اكتماله."
     try:
-        ck_rows = load_checkpoint_rows_ignore_fingerprint()
+        ck_rows = load_rows_for_mid_scrape_analysis()
     except Exception as e:
-        return False, f"قراءة النقطة: {e}"
+        return False, f"قراءة صفوف المنافس: {e}"
     if not ck_rows:
-        return False, "لا توجد صفوف في نقطة الحفظ بعد."
+        return False, "لا توجد صفوف مكسوبة بعد — انتظر حتى تُكتب أول دفعة إلى الملف المباشر."
     our_path = os.path.join("data", "mahwous_catalog.csv")
     if not os.path.isfile(our_path):
         return False, "لا يوجد `data/mahwous_catalog.csv` — ارفع الكتالوج أولاً."
@@ -1545,7 +1657,7 @@ def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
             "checkpoint_path": os.path.join("data", "scraper_checkpoint.json"),
         }
     try:
-        ck_rows = load_checkpoint_rows_ignore_fingerprint()
+        ck_rows = load_rows_for_mid_scrape_analysis()
     except Exception:
         ck_rows = []
 
@@ -1646,7 +1758,7 @@ def _run_scrape_chain_background():
     user_label = str(ctx.get("user_comp_label") or "").strip()
     # اسمح بالتحديث اللحظي حتى عند تشغيل الكشط في الخلفية.
     pipeline_inline = bool(ctx.get("pipeline_inline", True))
-    pl_every = int(ctx.get("pl_every") or 100)
+    pl_every = max(0, int(ctx.get("pl_every") or 3))
     use_ai_partial = bool(ctx.get("use_ai_partial"))
     our_file_name = str(ctx.get("our_file_name") or "mahwous_catalog.csv")
     _raw_inc = os.environ.get("SCRAPER_INCREMENTAL_EVERY", "").strip()
@@ -2441,6 +2553,14 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
 # ════════════════════════════════════════════════
 with st.sidebar:
     _hydrate_checkpoint_sort_pending()
+    _cp_flash = st.session_state.pop("_checkpoint_sort_user_flash", None)
+    if _cp_flash is not None:
+        _fp_ok, _fp_msg = (
+            _cp_flash
+            if isinstance(_cp_flash, tuple) and len(_cp_flash) == 2
+            else (False, str(_cp_flash))
+        )
+        (st.success if _fp_ok else st.warning)(_fp_msg)
     st.markdown(f"## {APP_ICON} {APP_TITLE}")
     st.caption(f"الإصدار {APP_VERSION}")
 
@@ -2560,6 +2680,29 @@ with st.sidebar:
                 "⏳ **الأرقام أعلاه** تتحدّث بعد انتهاء المحرك من الدفعة الحالية — "
                 "شريط التقدم و«صفوف مكسوبة» يتحركان أثناء الكشط والمطابقة."
             )
+        try:
+            _n_sort_sb = len(load_rows_for_mid_scrape_analysis())
+        except Exception:
+            _n_sort_sb = 0
+        _ck_sort_busy = bool((_live_sb.get("checkpoint_sort") or {}).get("active"))
+        if st.button(
+            "⚡ تحليل الآن (دون إيقاف الكشط)",
+            key="sidebar_analyze_while_scrape_btn",
+            disabled=_n_sort_sb == 0 or _ck_sort_busy,
+            help="يشغّل فرز المطابقة على المنتجات المكسوبة حتى الآن (ملف مباشر أو نقطة الحفظ). الكشط يستمر.",
+            use_container_width=True,
+        ):
+            ok_sb, err_sb = _start_checkpoint_sort_background(log_action="sidebar_live_sort")
+            if ok_sb:
+                st.session_state["_checkpoint_sort_user_flash"] = (
+                    True,
+                    "✅ بدأ التحليل — راقب شريط «فرز من نقطة الحفظ» أدناه",
+                )
+            else:
+                st.session_state["_checkpoint_sort_user_flash"] = (False, f"⚠️ {err_sb}")
+            # لا st.rerun — يتعارض مع st_autorefresh ويمنع ظهور الرسالة
+        if _n_sort_sb > 0:
+            st.caption(f"📦 جاهز للفرز الفوري: **{_n_sort_sb:,}** منتج منافس")
         try:
             from streamlit_autorefresh import st_autorefresh
 
@@ -2684,32 +2827,11 @@ with st.sidebar:
                     )
                 st.session_state.job_running = False
 
-    st.markdown("---")
-    try:
-        _nav_legacy_clicked = st.button(
-            "🛠️ التدقيق والتحسين",
-            key="nav_legacy_tools",
-            use_container_width=True,
-            type="tertiary",
-        )
-    except TypeError:
-        _nav_legacy_clicked = st.button(
-            "🛠️ التدقيق والتحسين",
-            key="nav_legacy_tools",
-            use_container_width=True,
-        )
-    if _nav_legacy_clicked:
-        st.session_state.legacy_tools_mode = True
-        st.rerun()
 
-    page = st.radio(
-        "الأقسام",
-        SECTIONS,
-        label_visibility="collapsed",
-        key="sidebar_page_radio",
-    )
 
+    # التنقل الرئيسي أدناه (segmented_control + pills) — يُزامَن مع sidebar_page_radio بعد التحليل
     st.markdown("---")
+    # تمت إزالة زر الحذف من الجانب
     if st.session_state.results:
         r = st.session_state.results
         st.markdown("**📊 ملخص:**")
@@ -2742,15 +2864,53 @@ with st.sidebar:
                     unsafe_allow_html=True)
 
 
-# ════════════════════════════════════════════════
-#  أدوات v11 المعزولة (مقارنة / مدقق متجر / SEO) — legacy_core + legacy_tools_dashboard
-# ════════════════════════════════════════════════
-if st.session_state.get("legacy_tools_mode"):
-    from legacy_tools_dashboard import render_legacy_dashboard
+# (أدوات التدقيق تم دمجها بالأسفل)
 
-    render_legacy_dashboard()
-    st.stop()
 
+# ════════════════════════════════════════════════
+#  تصميم الواجهة الحديث (Premium Navigation)
+# ════════════════════════════════════════════════
+st.markdown("<style>.stTabs > div[data-baseweb='tab-list'] { gap: 8px; }</style>", unsafe_allow_html=True)
+
+nav_groups = {
+    "🌐 الرئيسية": ["📊 لوحة التحكم", "📜 السجل", "✔️ تمت المعالجة"],
+    "🕸️ العمليات": ["📂 رفع الملفات", "➕ منتج سريع"],
+    "📊 التحليل والقرارات": ["🔴 سعر أعلى", "🟢 سعر أقل", "✅ موافق عليها", "🔍 منتجات مفقودة", "⚠️ تحت المراجعة"],
+    "🛠️ التدقيق والتحسين": ["🔀 المقارنة", "🏪 مدقق المتجر", "🔍 معالج السيو"],
+    "⚙️ الإعدادات والأتمتة": ["🔄 الأتمتة الذكية", "⚡ أتمتة Make", "🤖 الذكاء الصناعي", "⚙️ الإعدادات"]
+}
+
+# توجيه الشريط الجانبي بعد اكتمال التحليل → نفس القسم في المنطقة الرئيسية (توزيع المنتجات 🔴🟢…)
+_focus_nav = st.session_state.get("sidebar_page_radio")
+if _focus_nav:
+    _cat_for_focus = next(
+        (c for c, pgs in nav_groups.items() if _focus_nav in pgs),
+        "🌐 الرئيسية",
+    )
+    if st.session_state.get("_nav_last_sidebar_focus") != _focus_nav:
+        st.session_state["_nav_last_sidebar_focus"] = _focus_nav
+        st.session_state["nav_main_cat"] = _cat_for_focus
+        st.session_state["nav_page_pill"] = _focus_nav
+
+# الملاحة الرئيسية (الفئات) بتصميم Tabs/Pills — مفاتيح ثابتة للحفظ بين إعادة التشغيل
+main_cat = st.segmented_control(
+    "الفئات الرئيسية",
+    list(nav_groups.keys()),
+    default="🌐 الرئيسية",
+    key="nav_main_cat",
+)
+if not main_cat:
+    main_cat = "🌐 الرئيسية"
+
+_sub_pages = nav_groups[main_cat]
+if st.session_state.get("nav_page_pill") not in _sub_pages:
+    st.session_state["nav_page_pill"] = _sub_pages[0]
+
+page = st.pills("اختر القسم", _sub_pages, key="nav_page_pill")
+if not page:
+    page = _sub_pages[0]
+
+st.markdown("---")
 
 # ════════════════════════════════════════════════
 #  1. لوحة التحكم
@@ -3026,8 +3186,8 @@ elif page == "📂 رفع الملفات":
     )
     st.caption(
         "💾 **دفعات أثناء الكشط:** يُحدَّث `data/competitors_latest.csv` وكتالوج المنافس كلّما تجاوز العدد "
-        "`SCRAPER_INCREMENTAL_EVERY` (أو نفس خطوة المسار المترافق `SCRAPER_PIPELINE_EVERY`). "
-        "المسار المترافق يُعيد المطابقة على **جميع** المنتجات المكسوبة حتى تلك اللحظة — دون انتظار نهاية الكشط."
+        "`SCRAPER_INCREMENTAL_EVERY` (أو نفس خطوة المسار المترافق `SCRAPER_PIPELINE_EVERY`، افتراضي **3** صفوف). "
+        "المطابقة تُشغَّل على **كل** المنتجات المكسوبة حتى تلك اللحظة وتُكتب إلى اللقطة/الجلسة لتحديث الواجهة."
     )
 
     pipeline_inline = bool(pipeline_inline) and (not scrape_bg)
@@ -3150,7 +3310,10 @@ elif page == "📂 رفع الملفات":
                     ctx = {
                         "our_df": our_df_pre,
                         "pipeline_inline": True if scrape_bg else pipeline_inline,
-                        "pl_every": int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100")),
+                        "pl_every": max(
+                            0,
+                            int(os.environ.get("SCRAPER_PIPELINE_EVERY", "3") or 3),
+                        ),
                         "use_ai_partial": os.environ.get(
                             "SCRAPER_PIPELINE_AI_PARTIAL", ""
                         ).strip().lower()
@@ -4552,9 +4715,23 @@ elif page == "⚡ أتمتة Make":
 # ════════════════════════════════════════════════
 #  10. الإعدادات
 # ════════════════════════════════════════════════
+elif page == "🔀 المقارنة":
+    from legacy_tools_dashboard import render_compare_tab
+    render_compare_tab()
+elif page == "🏪 مدقق المتجر":
+    from legacy_tools_dashboard import render_store_audit_tab
+    render_store_audit_tab()
+elif page == "🔍 معالج السيو":
+    from legacy_tools_dashboard import render_seo_processor_tab
+    render_seo_processor_tab()
+
 elif page == "⚙️ الإعدادات":
     st.header("⚙️ الإعدادات")
     db_log("settings", "view")
+    _fr = st.session_state.pop("_reset_app_flash", None)
+    if _fr:
+        _fk, _ft = _fr if isinstance(_fr, tuple) and len(_fr) == 2 else ("ok", str(_fr))
+        (st.warning if _fk == "warn" else st.success)(_ft)
 
     tab1, tab2, tab3, tab4 = st.tabs(["🔑 المفاتيح", "⚙️ المطابقة", "📜 السجل", "🏷️ صف ماركة جديدة"])
 
@@ -4615,6 +4792,60 @@ elif page == "⚙️ الإعدادات":
             if st.button("🔄 مزامنة الروابط مع الإرسال الآن", key="btn_sync_make_webhooks"):
                 _ensure_make_webhooks_session()
                 st.success("تمت المزامنة — شريط «🔗 Make» في الشريط الجانبي يتحدّث بعد إعادة التحميل.")
+                st.rerun()
+
+        st.markdown("---")
+
+        with st.expander("🧹 تصفير التطبيق (إعادة لوحة التحكم لصفر)", expanded=False):
+            st.caption(
+                "يحذف **آخر تحليل محفوظ** و**لقطات الكشط** و**نقاط الحفظ** ولا يمس ملف "
+                "`data/mahwous_catalog.csv` ولا جداول كتالوج المنافسين في قاعدة البيانات."
+            )
+            _rh = st.checkbox("إظهار المنتجات التي كانت «مخفية» بعد الإرسال", value=True, key="reset_show_hidden")
+            _rm = st.checkbox("حذف كاش المطابقة (match_cache_v21.db)", value=True, key="reset_match_cache")
+            _rs = st.checkbox("مسح حالة الكاشط ونقاط الحفظ", value=True, key="reset_scraper_state")
+            _rlog = st.checkbox(
+                "مسح سجل التحليلات/الأسعار/الأحداث (نفس صفحة 📜 السجل)",
+                value=False,
+                key="reset_also_persistent_logs",
+            )
+            if st.button("🧹 تصفير الآن وتصفير الأرقام", type="primary", key="btn_full_app_reset"):
+                _res = reset_application_session_storage(
+                    clear_hidden_products=_rh,
+                    clear_match_cache_file=_rm,
+                    clear_scraper_state=_rs,
+                )
+                _clear_scrape_live_snapshot()
+                _clear_live_session_pkl()
+                _reset_streamlit_after_storage_reset()
+                db_log("settings", "full_reset", str(len(_res.get("files_removed", []))))
+                _errs = _res.get("errors") or []
+                _log_note = ""
+                if _rlog:
+                    _lr = clear_app_persistent_logs(
+                        clear_analysis_history=True,
+                        clear_price_history=True,
+                        clear_events=True,
+                        clear_decisions=False,
+                        clear_ai_cache=False,
+                    )
+                    if _lr.get("errors"):
+                        _errs = list(_errs) + list(_lr["errors"])
+                    else:
+                        _log_note = "؛ سُجّل السجل: " + ", ".join(
+                            f"{k}={v}" for k, v in (_lr.get("deleted") or {}).items()
+                        )
+                if _errs:
+                    st.session_state["_reset_app_flash"] = (
+                        "warn",
+                        "⚠️ التصفير اكتمل مع أخطاء جزئية: " + " | ".join(_errs[:5]),
+                    )
+                else:
+                    st.session_state["_reset_app_flash"] = (
+                        "ok",
+                        f"✅ تم التصفير — أزيلت {_res.get('jobs_deleted', 0)} سجل تحليل و"
+                        f"{len(_res.get('files_removed', []))} ملفًا محليًا{_log_note}.",
+                    )
                 st.rerun()
 
         st.markdown("---")
@@ -4724,6 +4955,10 @@ elif page == "⚙️ الإعدادات":
         st.info(f"هامش فرق السعر: {PRICE_DIFF_THRESHOLD} ر.س")
 
     with tab3:
+        st.caption(
+            "جدول `decisions` في نفس قاعدة البيانات — لمسح القرارات استخدم 📜 السجل → "
+            "«مسح السجل» وفعّل «مسح قرارات المنتجات»."
+        )
         decisions = get_decisions(limit=30)
         if decisions:
             df_dec = pd.DataFrame(decisions)
@@ -4849,6 +5084,49 @@ elif page == "📜 السجل":
     st.header("📜 السجل الكامل")
     db_log("log", "view")
 
+    _log_flash = st.session_state.pop("_log_page_flash", None)
+    if _log_flash:
+        _lk, _lt = _log_flash if isinstance(_log_flash, tuple) and len(_log_flash) == 2 else ("ok", str(_log_flash))
+        (st.warning if _lk == "warn" else st.success)(_lt)
+
+    st.info(
+        "**من أين هذه النتائج؟** تُحفظ في ملف SQLite واحد (ليست من `data/` مباشرة):\n\n"
+        f"`{DB_PATH}`\n\n"
+        "• **📊 التحليلات** ← جدول `analysis_history` (يُملأ عند كل تشغيل تحليل ناجح).\n"
+        "• **💰 تغييرات الأسعار** ← جدول `price_history` (مقارنة أسعار عبر الزمن).\n"
+        "• **📝 الأحداث** ← جدول `events` (تصفح الصفحات والإجراءات في التطبيق)."
+    )
+
+    with st.expander("🧹 مسح السجل من قاعدة البيانات (نتائج جديدة فارغة)", expanded=False):
+        st.caption(
+            "لا يحذف الكتالوج أو نتائج التحليل الحالية في الذاكرة — فقط السجلات المعروضة في هذه الصفحة."
+        )
+        _ca = st.checkbox("مسح تاريخ التحليلات", value=True, key="log_clr_analysis")
+        _cp = st.checkbox("مسح تاريخ أسعار المنتجات", value=True, key="log_clr_prices")
+        _ce = st.checkbox("مسح سجل الأحداث (التصفح)", value=True, key="log_clr_events")
+        _cd = st.checkbox("مسح قرارات المنتجات (جدول decisions)", value=False, key="log_clr_decisions")
+        _ci = st.checkbox("مسح كاش طلبات AI (ai_cache) — إعادة استدعاء API لاحقاً", value=False, key="log_clr_ai")
+        if st.button("🗑️ تنفيذ المسح", type="primary", key="log_clr_run"):
+            _lr = clear_app_persistent_logs(
+                clear_analysis_history=_ca,
+                clear_price_history=_cp,
+                clear_events=_ce,
+                clear_decisions=_cd,
+                clear_ai_cache=_ci,
+            )
+            if _lr.get("errors"):
+                st.session_state["_log_page_flash"] = (
+                    "warn",
+                    "⚠️ " + " | ".join(_lr["errors"][:3]),
+                )
+            else:
+                _parts = [f"{k}: {v}" for k, v in (_lr.get("deleted") or {}).items()]
+                st.session_state["_log_page_flash"] = (
+                    "ok",
+                    "✅ تم مسح السجل — " + ("، ".join(_parts) if _parts else "لا صفوف"),
+                )
+            st.rerun()
+
     tab1, tab2, tab3 = st.tabs(["📊 التحليلات", "💰 تغييرات الأسعار", "📝 الأحداث"])
 
     with tab1:
@@ -4914,7 +5192,10 @@ elif page == "🔄 الأتمتة الذكية":
 
         if st.session_state.results and st.session_state.analysis_df is not None:
             adf = st.session_state.analysis_df
-            matched_df = adf[adf["نسبة_التطابق"].apply(lambda x: safe_float(x)) >= 85].copy()
+            if "نسبة_التطابق" in adf.columns:
+                matched_df = adf[adf["نسبة_التطابق"].apply(lambda x: safe_float(x)) >= 85].copy()
+            else:
+                matched_df = pd.DataFrame()
             st.info(f"📦 {len(matched_df)} منتج مؤكد المطابقة جاهز للتقييم التلقائي")
 
             col_a, col_b = st.columns(2)
@@ -5085,3 +5366,23 @@ AUTOMATION_RULES_DEFAULT.append({
             }), use_container_width=True)
         else:
             st.info("لا توجد قرارات مسجلة بعد — شغّل الأتمتة من التاب الأول")
+
+# ════════════════════════════════════════════════
+# 🚀 تفعيل المحرك الفوري والتحديث التلقائي (v26.0)
+# ════════════════════════════════════════════════
+# استدعاء المعالجة الفورية في كل rerun لضمان تحديث العدادات
+if "results" in st.session_state:
+    _process_realtime_queue_main_thread()
+
+# تفعيل التحديث التلقائي إذا كان الكشط جارياً
+_snap_for_refresh = read_scraper_bg_state()
+if _snap_for_refresh.get("active") or _snap_for_refresh.get("phase") == "scrape":
+    st_autorefresh(interval=5000, key="scraper_ui_refresh")
+
+# معالجة المنتجات السابقة تلقائياً إذا كانت الجلسة فارغة ويوجد نقطة حفظ
+if st.session_state.get("results") is None and not st.session_state.get("job_running"):
+    _ck_stat = get_checkpoint_recovery_status()
+    if _ck_stat.get("usable_row_count", 0) > 0:
+        # تشغيل الفرز التلقائي في الخلفية للمنتجات السابقة
+        _ck_comp_key = _infer_comp_key_for_checkpoint_recovery()
+        _start_checkpoint_sort_background(log_action="auto_recovery_sort")

@@ -4,6 +4,7 @@ config.py - الإعدادات المركزية v19.0
 """
 import json as _json
 import os as _os
+import tempfile
 
 # ===== معلومات التطبيق =====
 APP_TITLE   = "نظام التسعير الذكي - مهووس"
@@ -71,6 +72,9 @@ def _parse_gemini_keys():
 
     # ─── المحاولة 2: GEMINI_API_KEY (مفتاح واحد) ───
     single = _s("GEMINI_API_KEY", "")
+    # Railway/UI أحياناً يحفظان Gemini_API_Key (حالة أحرف مختلفة؛ Linux حساس)
+    if not single:
+        single = (_os.environ.get("Gemini_API_Key", "") or _os.environ.get("GEMINI_KEY", "")).strip()
     if single and single not in keys:
         keys.append(single)
 
@@ -81,31 +85,92 @@ def _parse_gemini_keys():
         if k and k not in keys:
             keys.append(k)
 
-    # تنظيف نهائي: إزالة المفاتيح الفارغة أو القصيرة
-    keys = [k.strip() for k in keys if k and len(k) > 20]
+    # ─── أسماء بديلة شائعة (Railway / Google AI Studio) ───
+    for n in ("GOOGLE_API_KEY", "GOOGLE_AI_API_KEY", "GENERATIVE_AI_API_KEY"):
+        k = _s(n, "")
+        if k and k not in keys:
+            keys.append(k)
+
+    # تنظيف نهائي: مفاتيح Google عادة ≥30 حرفاً؛ الحد الأدنى 12 لتجنب القيم الوهمية
+    keys = [k.strip() for k in keys if k and len(k.strip()) >= 12]
     return keys
 
 
+def get_gemini_api_keys():
+    """إعادة قراءة المفاتيح من البيئة (مفيد للعرض بعد تغيير Variables دون إعادة تشغيل العملية)."""
+    return _parse_gemini_keys()
+
+
+def get_openrouter_api_key() -> str:
+    """إعادة قراءة المفتاح من البيئة (Railway / Secrets دون إعادة تشغيل العملية)."""
+    return _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
+
+
+def get_cohere_api_key() -> str:
+    return _s("COHERE_API_KEY") or ""
+
+
 # ══════════════════════════════════════════════
-#  المفاتيح الفعلية
+#  المفاتيح الفعلية (من البيئة / .streamlit/secrets.toml فقط — لا مفاتيح داخل الكود)
 # ══════════════════════════════════════════════
 GEMINI_API_KEYS    = _parse_gemini_keys()
 GEMINI_API_KEY     = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
-OPENROUTER_API_KEY = _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
-COHERE_API_KEY     = _s("COHERE_API_KEY") or ""
+OPENROUTER_API_KEY = get_openrouter_api_key()
+COHERE_API_KEY     = get_cohere_api_key()
 EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 
+# NDJSON لأحداث الكشط — يقرأ من secrets ثم يضبط البيئة لـ engines/scrape_event.py
+_ndjson_flag = (_s("MAHWOUS_SCRAPE_EVENTS_NDJSON", "") or "").strip().lower()
+if _ndjson_flag in ("1", "true", "yes", "on"):
+    _os.environ.setdefault("MAHWOUS_SCRAPE_EVENTS_NDJSON", "1")
+
+
 # ══════════════════════════════════════════════
-#  Make Webhooks
+#  Make Webhooks (يُفضَّل الدوال — تقرأ البيئة/Secrets بعد مزامنة الجلسة في app.py)
 # ══════════════════════════════════════════════
-WEBHOOK_UPDATE_PRICES = (
-    _s("WEBHOOK_UPDATE_PRICES") or
-    "https://hook.eu2.make.com/8jia6gc7s1cpkeg6catlrvwck768sbfk"
+def get_webhook_update_prices() -> str:
+    return (_s("WEBHOOK_UPDATE_PRICES") or "").strip()
+
+
+def get_webhook_missing_products() -> str:
+    """
+    سيناريو «أتمتة التسعير» / إضافة المفقودات في سلة فقط.
+    يفضّل WEBHOOK_MISSING_PRODUCTS؛ إن وُجد WEBHOOK_NEW_PRODUCTS قديماً يُستخدم كاحتياط.
+    """
+    v = (_s("WEBHOOK_MISSING_PRODUCTS") or "").strip()
+    if v:
+        return v
+    return (_s("WEBHOOK_NEW_PRODUCTS") or "").strip()
+
+
+def get_webhook_new_products() -> str:
+    """توافق خلفي — نفس دالة المفقودات."""
+    return get_webhook_missing_products()
+
+
+# توثيق روابط سيناريوهات Make المشتركة (الاستنساخ من المتصفح — الرابط الفعلي للـ Webhook من لوحتك)
+MAKE_DOCS_SCENARIO_UPDATE_PRICES = (
+    "https://eu2.make.com/public/shared-scenario/9uue7ENfzO5/integration-webhooks-salla"
 )
-WEBHOOK_NEW_PRODUCTS = (
-    _s("WEBHOOK_NEW_PRODUCTS") or
-    "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
+MAKE_DOCS_SCENARIO_PRICING_AUTOMATION = (
+    "https://eu2.make.com/public/shared-scenario/UsesKnA62xy/mahwous-pricing-automation-salla"
 )
+
+# ══════════════════════════════════════════════
+#  كشط (async_scraper.py) — تُقرأ من os.environ على التشغيل
+#  • SCRAPER_MAX_CONCURRENT_FETCH (افتراضي 28، حد أعلى 64) — تزيد السرعة؛ خفّضها عند الحظر
+#  • SCRAPER_PIPELINE_EVERY — فاصل لقطات المطابقة أثناء الكشط (افتراضي 3؛ 1 = أشد فورية؛ 0 يعطّل الوسيط)
+#  • MAHWOUS_UI_LIVE_REFRESH_MS — تبطئة تحديث واجهة Streamlit أثناء الكشط الطويل
+#  • MAHWOUS_SCRAPE_UI_MIN_INTERVAL_SEC — أقل فاصل (ثوانٍ) بين كتابات لقطة JSON للتقدم الحي (افتراضي حسب حجم الطابور)
+#  استيراد سلة (utils/helpers.py export_missing_products_to_salla_csv_bytes):
+#  • SALLA_IMPORT_DEFAULT_CATEGORY — مسار تصنيف افتراضي يطابق categories.csv / لوحة سلة
+#  • SALLA_IMPORT_FALLBACK_BRAND — ماركة احتياط عند «غير محدد» (نص كما في brands.csv)
+#  • WEBHOOK_UPDATE_PRICES — تعديل أسعار (🔴 أعلى 🟢 أقل ✅ موافق)؛ WEBHOOK_MISSING_PRODUCTS — مفقودات فقط
+#  • WEBHOOK_NEW_PRODUCTS — اسم قديم؛ يُقرأ كاحتياط إن لم يُضبط WEBHOOK_MISSING_PRODUCTS
+#  AI (engines/ai_engine.py):
+#  • OPENROUTER_MODELS — معرّفات نماذج OpenRouter مفصولة بفواصل (تجاوز القائمة الافتراضية)
+#  • احذف COHERE_API_KEY من Secrets إذا كان 401 لتقليل الضوضاء (Cohere اختياري)
+# ══════════════════════════════════════════════
 
 # ══════════════════════════════════════════════
 #  ألوان
@@ -132,6 +197,7 @@ PRICE_DIFF_THRESHOLD = PRICE_TOLERANCE
 REJECT_KEYWORDS = [
     "sample","عينة","عينه","decant","تقسيم","تقسيمة",
     "split","miniature","0.5ml","1ml","2ml","3ml",
+    "vial","سمبل",
 ]
 TESTER_KEYWORDS = ["tester","تستر","تيستر"]
 SET_KEYWORDS    = ["set","gift set","طقم","مجموعة","coffret"]
@@ -212,6 +278,8 @@ AUTOMATION_RULES_DEFAULT = [
 AUTO_SEARCH_INTERVAL_MINUTES = 60 * 6   # كل 6 ساعات
 AUTO_PUSH_TO_MAKE = False               # إرسال تلقائي لـ Make.com (يتطلب تفعيل يدوي)
 AUTO_DECISION_CONFIDENCE = 92           # حد الثقة للقرار التلقائي (تسعير/رفع-خفض)
+# حاجز المفقودات: تطابق نصي مع كتالوجنا (token_set_ratio) — يُستبعد عند ≥88%
+SMART_MISSING_FUZZ_THRESHOLD = 88
 # تحقق AI لقسم المراجعة — واقعي مع مخرجات verify_match (غالباً 65–90)
 REVIEW_VERIFY_MIN_CONFIDENCE = 72
 
@@ -221,6 +289,7 @@ REVIEW_VERIFY_MIN_CONFIDENCE = 72
 SECTIONS = [
     "📊 لوحة التحكم",
     "📂 رفع الملفات",
+    "➕ منتج سريع",
     "🔴 سعر أعلى",
     "🟢 سعر أقل",
     "✅ موافق عليها",
@@ -235,8 +304,8 @@ SECTIONS = [
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-# مسار SQLite الوحيد — يُعرّف في db_manager ويُستورد هنا لتوحيد الأتمتة مع باقي التطبيق
-from utils.db_manager import DB_PATH  # noqa: E402
+# مسار SQLite — نفس الاسم في كل الوحدات؛ temp يعمل على Windows وLinux وStreamlit Cloud
+DB_PATH = _os.path.join(tempfile.gettempdir(), "pricing_v18.db")
 
 # قائمة المنافسين الافتراضية للكشط — يُحمَّل من الملف؛ يمكن تعديل JSON دون المساس بالكود
 PRESET_COMPETITORS_PATH = _os.path.join("data", "preset_competitors.json")

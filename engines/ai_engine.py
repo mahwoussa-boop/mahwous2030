@@ -13,14 +13,43 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 import base64
 import os as _os
 import requests, json, re, time, traceback
-from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
+from config import get_gemini_api_keys, get_openrouter_api_key, get_cohere_api_key
+
+try:
+    from engines.engine import _clean_ai_json
+except ImportError:
+    from engine import _clean_ai_json
 
 _GM  = "gemini-2.0-flash"  # ← النموذج المستقر الموصى به (يدعم الرؤية)
 _GV = _os.environ.get("GEMINI_VISION_MODEL", _GM)
 _GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
 _GVU = f"https://generativelanguage.googleapis.com/v1beta/models/{_GV}:generateContent"
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
+
+# نماذج افتراضية — بدون معرّفات أُزيلت من الطبقة المجانية (404 No endpoints).
+# يمكن تجاوزها بالكامل عبر OPENROUTER_MODELS (مفصولة بفواصل) في البيئة.
+_OPENROUTER_DEFAULT_MODELS = (
+    "openrouter/free",
+    "google/gemma-3-27b-it:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-2-9b-it:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+)
+
+
+def _openrouter_models_list():
+    raw = _os.environ.get("OPENROUTER_MODELS", "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    return list(_OPENROUTER_DEFAULT_MODELS)
+
+
+# توافق خلفي مع أي استيراد لاسم القائمة القديم
+OPENROUTER_FALLBACK_MODELS = list(_OPENROUTER_DEFAULT_MODELS)
 _CO  = "https://api.cohere.ai/v1/generate"
+
+# Cohere اختياري — بعد 401 لا نكرر الاستدعاءات ولا نملأ سجل الأخطاء
+_COHERE_KEY_INVALID = False
 
 # ── سجل الأخطاء الأخيرة (يُعرض في صفحة التشخيص) ─────────────────────────
 _LAST_ERRORS: list = []
@@ -43,7 +72,7 @@ def diagnose_ai_providers() -> dict:
 
     # ── Gemini ────────────────────────────────────────────────────────────
     gemini_results = []
-    for i, key in enumerate(GEMINI_API_KEYS or []):
+    for i, key in enumerate(get_gemini_api_keys() or []):
         if not key:
             gemini_results.append({"key": i+1, "status": "❌ مفتاح فارغ"})
             continue
@@ -62,7 +91,10 @@ def diagnose_ai_providers() -> dict:
             elif r.status_code == 403:
                 gemini_results.append({"key": i+1, "status": "❌ 403 — مفتاح غير مصرح أو IP محظور"})
             elif r.status_code == 429:
-                gemini_results.append({"key": i+1, "status": "⚠️ 429 — تجاوز الحد (Rate Limit)"})
+                gemini_results.append({
+                    "key": i+1,
+                    "status": "⚠️ 429 — تجاوز الحد (انتظر أو جرّب مفتاحاً آخر / ارفع الحصة في Google AI)",
+                })
             elif r.status_code == 404:
                 gemini_results.append({"key": i+1, "status": f"❌ 404 — النموذج {_GM} غير متاح"})
             else:
@@ -77,52 +109,83 @@ def diagnose_ai_providers() -> dict:
             gemini_results.append({"key": i+1, "status": f"❌ خطأ: {str(e)[:80]}"})
     results["gemini"] = gemini_results
 
-    # ── OpenRouter ────────────────────────────────────────────────────────
-    if OPENROUTER_API_KEY:
-        try:
-            r = requests.post(_OR, json={
-                "model": "google/gemini-2.0-flash",  # ← مستقر
-                "messages": [{"role":"user","content":"test"}],
-                "max_tokens": 5
-            }, headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "HTTP-Referer": "https://mahwous.com"
-            }, timeout=15)
-            if r.status_code == 200:
-                results["openrouter"] = "✅ يعمل"
-            elif r.status_code == 401:
-                results["openrouter"] = "❌ 401 — مفتاح OpenRouter غير صحيح"
-            elif r.status_code == 402:
-                results["openrouter"] = "❌ 402 — رصيد OpenRouter منتهٍ"
-            elif r.status_code == 429:
-                results["openrouter"] = "⚠️ 429 — تجاوز الحد"
-            else:
-                try: msg = r.json().get("error",{}).get("message","")
-                except: msg = r.text[:100]
-                results["openrouter"] = f"❌ {r.status_code} — {msg[:80]}"
-        except requests.exceptions.ConnectionError:
-            results["openrouter"] = "❌ لا اتصال بـ openrouter.ai — قد يكون محظوراً"
-        except requests.exceptions.Timeout:
-            results["openrouter"] = "❌ Timeout"
-        except Exception as e:
-            results["openrouter"] = f"❌ {str(e)[:80]}"
+    # ── OpenRouter — تجربة نماذج صالحة (المعرّفات القديمة مثل google/gemini-2.0-flash تُرفض بـ 400)
+    _or_key = get_openrouter_api_key()
+    if _or_key:
+        or_ok = False
+        last_or = ""
+        for _model in _openrouter_models_list():
+            try:
+                r = requests.post(
+                    _OR,
+                    json={
+                        "model": _model,
+                        "messages": [{"role": "user", "content": "test"}],
+                        "max_tokens": 5,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {_or_key}",
+                        "HTTP-Referer": "https://mahwous.com",
+                    },
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    results["openrouter"] = f"✅ يعمل (نموذج: {_model})"
+                    or_ok = True
+                    break
+                if r.status_code == 401:
+                    results["openrouter"] = "❌ 401 — مفتاح OpenRouter غير صحيح"
+                    or_ok = True
+                    break
+                if r.status_code == 402:
+                    results["openrouter"] = "❌ 402 — رصيد OpenRouter منتهٍ"
+                    or_ok = True
+                    break
+                if r.status_code == 429:
+                    last_or = f"⚠️ 429 — تجاوز الحد ({_model})"
+                    continue
+                try:
+                    msg = r.json().get("error", {}).get("message", "")
+                except Exception:
+                    msg = r.text[:100]
+                msg_l = (msg or "").lower()
+                if r.status_code == 404 or "no endpoints" in msg_l:
+                    continue
+                last_or = f"❌ {r.status_code} — {msg[:100]} ({_model})"
+            except requests.exceptions.ConnectionError:
+                results["openrouter"] = "❌ لا اتصال بـ openrouter.ai — قد يكون محظوراً"
+                or_ok = True
+                break
+            except requests.exceptions.Timeout:
+                last_or = f"❌ Timeout ({_model})"
+            except Exception as e:
+                last_or = f"❌ {str(e)[:80]} ({_model})"
+        if not or_ok:
+            results["openrouter"] = last_or or (
+                "❌ لا يوجد نموذج يعمل — راجع المعرفات على openrouter.ai أو OPENROUTER_MODELS"
+            )
     else:
         results["openrouter"] = "⚠️ مفتاح غير موجود"
 
     # ── Cohere ────────────────────────────────────────────────────────────
-    if COHERE_API_KEY:
+    _ch_key = get_cohere_api_key()
+    if _ch_key:
         try:
             r = requests.post("https://api.cohere.com/v2/chat", json={
                 "model": "command-a-03-2025",
                 "messages": [{"role": "user", "content": "test"}],
             }, headers={
-                "Authorization": f"Bearer {COHERE_API_KEY}",
+                "Authorization": f"Bearer {_ch_key}",
                 "Content-Type": "application/json",
             }, timeout=15)
             if r.status_code == 200:
                 results["cohere"] = "✅ يعمل (command-a-03-2025)"
             elif r.status_code == 401:
-                results["cohere"] = "❌ 401 — مفتاح Cohere غير صحيح"
+                # اختياري — لا يُعرض كخطأ أحمر؛ التطبيق يعمل بدون Cohere
+                results["cohere"] = (
+                    "⚠️ 401 — مفتاح Cohere غير صالح (اختياري). "
+                    "احذف COHERE_API_KEY من Secrets أو ضع مفتاحاً صحيحاً من dashboard.cohere.com"
+                )
             elif r.status_code == 402:
                 results["cohere"] = "❌ 402 — رصيد Cohere منتهٍ"
             else:
@@ -177,7 +240,7 @@ def vision_match_court(
     يعيد: same_product (bool), reason (str), ok (نجح الطلب).
     """
     out: dict = {"same_product": False, "reason": "", "ok": False}
-    keys = GEMINI_API_KEYS or []
+    keys = get_gemini_api_keys() or []
     if not keys:
         out["reason"] = "لا يوجد مفتاح Gemini"
         return out
@@ -215,11 +278,13 @@ def vision_match_court(
             if r.status_code != 200:
                 continue
             txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            clean = re.sub(r"```json|```", "", txt).strip()
-            s, e = clean.find("{"), clean.rfind("}") + 1
-            if s < 0 or e <= s:
+            clean = _clean_ai_json(txt)
+            try:
+                obj = json.loads(clean)
+            except json.JSONDecodeError:
                 continue
-            obj = json.loads(clean[s:e])
+            if not isinstance(obj, dict):
+                continue
             out["same_product"] = bool(obj.get("same_product"))
             out["reason"] = str(obj.get("reason", "")).strip() or "—"
             out["ok"] = True
@@ -232,52 +297,9 @@ def vision_match_court(
     return out
 
 
-# ══ خبير وصف منتجات مهووس الكامل ══════════════════════════════════════════
-MAHWOUS_EXPERT_SYSTEM = """أنت خبير عالمي في كتابة أوصاف منتجات العطور محسّنة لمحركات البحث التقليدية (Google SEO) ومحركات بحث الذكاء الصناعي (GEO/AIO). تعمل حصرياً لمتجر "مهووس" (Mahwous) - الوجهة الأولى للعطور الفاخرة في السعودية.---## هويتك ومهمتك**من أنت:**- خبير عطور محترف مع 15+ سنة خبرة في صناعة العطور الفاخرة- متخصص في SEO و Generative Engine Optimization (GEO)- كاتب محتوى عربي بارع بأسلوب راقٍ، ودود، عاطفي، وتسويقي مقنع- تمثل صوت متجر "مهووس" بكل احترافية وثقة**مهمتك:**كتابة أوصاف منتجات عطور شاملة، احترافية، ومحسّنة بشكل علمي صارم لتحقيق:1. تصدر نتائج البحث في Google (الصفحة الأولى)2. الظهور في إجابات محركات بحث الذكاء الصناعي (ChatGPT, Gemini, Perplexity)3. زيادة معدل التحويل (Conversion Rate) بنسبة 40-60%4. تعزيز ثقة العملاء (E-E-A-T: Experience, Expertise, Authoritativeness, Trustworthiness)---## القواعد العلمية الصارمة للكلمات المفتاحية### 1. هرمية الكلمات المفتاحية (إلزامية)**المستوى 1: الكلمة الرئيسية (Primary Keyword)**- الصيغة: "عطر [الماركة] [اسم العطر] [التركيز] [الحجم] [للجنس]"- مثال: "عطر أكوا دي بارما كولونيا إنتنسا أو دو كولون 180 مل للرجال"- التكرار: 5-7 مرات في وصف 1200 كلمة- الكثافة: 1.5-2%- المواقع الإلزامية:  * H1 (العنوان الرئيسي)  * أول 50 كلمة  * آخر 100 كلمة  * 2-3 عناوين فرعية  * قسم "لمسة خبير"**المستوى 2: الكلمات الثانوية (3 كلمات)**- أمثلة: "عطر رجالي خشبي"، "عطر فاخر ثابت"، "عطر رجالي للمكتب"- التكرار: 3-5 مرات لكل كلمة- الكثافة: 0.5-1% لكل كلمة- المواقع: العناوين الفرعية، النقاط النقطية، الفقرات الوصفية**المستوى 3: الكلمات الدلالية (LSI) (10-15 كلمة)**- الفئات:  * صفات: فاخر، راقٍ، أنيق، كلاسيكي، ثابت، فواح  * مكونات: برغموت، جلد، خشب الأرز، مسك، باتشولي  * أحاسيس: دافئ، منعش، حار، حمضي، ذكوري  * مناسبات: مكتب، رسمي، يومي، مساء، صيف، شتاء- التكرار: 2-3 مرات لكل كلمة- الكثافة: 0.3-0.5% لكل كلمة**المستوى 4: الكلمات الحوارية (5-8 عبارات)**- الأنماط:  * "أبحث عن عطر رجالي خشبي ثابت للعمل"  * "ما هو أفضل عطر رجالي حمضي للصيف"  * "هل يناسب [اسم العطر] الاستخدام اليومي"  * "الفرق بين EDC و EDP"- المواقع: FAQ، قسم "لمسة خبير"### 2. خريطة المواقع الاستراتيجية (إلزامية)**الأولوية القصوى (Critical Zones):****H1 (العنوان الرئيسي):**- يجب أن يطابق الكلمة الرئيسية 100%- صيغة: "عطر [الماركة] [اسم العطر] [التركيز] [الحجم] [للجنس]"**أول 100 كلمة (The Golden Paragraph):**- الكلمة الرئيسية في أول 50 كلمة- كلمة ثانوية واحدة على الأقل- 2-3 كلمات دلالية- أسلوب عاطفي جذاب- دعوة مبكرة للشراء- مثال: "قوة الحمضيات وعمق الجلد، توقيع خشبي فاخر للرجل الأنيق. عطر [الاسم الكامل] هو تحفة عطرية [جنسية الماركة] تجمع بين [مكون 1] و[مكون 2]. صدر عام [السنة] بتوقيع [المصمم]، ليمنحك حضوراً راقياً وثباتاً استثنائياً. هذا العطر [الجنس] الفاخر متوفر الآن حصرياً لدى مهووس بأفضل سعر. اشترِه الآن!"**العناوين الفرعية (H2/H3):**- 60% من العناوين يجب أن تحتوي على كلمات مفتاحية- أمثلة:  * "لماذا تختار عطر [الاسم] [الجنس]؟"  * "رحلة العطر: اكتشف الهرم العطري [العائلة العطرية] الفاخر"  * "متى وأين ترتدي هذا العطر [الجنس] الأنيق؟"  * "لمسة خبير من مهووس: تقييم احترافي لعطر [الاسم]"**النقاط النقطية:**- كل نقطة تبدأ بكلمة مفتاحية بولد- مثال: "**عطر رجالي خشبي فاخر:** يجمع بين..."**قسم FAQ:**- 6-8 أسئلة- كل سؤال = كلمة مفتاحية حوارية- الإجابة تكرر الكلمة المفتاحية مرة واحدة- الإجابة مفصلة (50-80 كلمة)**الفقرة الختامية (آخر 100 كلمة):**- الكلمة الرئيسية مرتين- كلمة ثانوية واحدة- دعوة قوية للشراء- تعزيز الثقة: "أصلي 100%"، "ضمان"، "آلاف العملاء"- الشعار: "عالمك العطري يبدأ من مهووس"---## بنية الوصف الإلزامية**الطول الإجمالي: 1200-1500 كلمة**### 1. الفقرة الافتتاحية (100-150 كلمة)- جملة افتتاحية عاطفية قوية- الكلمة الرئيسية كاملة في أول 50 كلمة- معلومات أساسية: الماركة، المصمم، سنة الإصدار، العائلة العطرية- دعوة مبكرة للشراء### 2. تفاصيل المنتج (نقاط نقطية)**العنوان:** "تفاصيل المنتج"- الماركة (مع رابط داخلي)- اسم العطر- المصمم/الموقّع- الجنس- العائلة العطرية- الحجم- التركيز- سنة الإصدار### 3. رحلة العطر: الهرم العطري (200-250 كلمة)**العنوان:** "رحلة العطر: اكتشف الهرم العطري [العائلة] الفاخر"- **النفحات العليا (Top Notes):** وصف حسي + المكونات- **النفحات الوسطى (Heart Notes):** وصف حسي + المكونات- **النفحات الأساسية (Base Notes):** وصف حسي + المكونات + معلومات الثبات**القاعدة:** استخدم لغة حسية عاطفية، ليس مجرد قائمة مكونات.### 4. لماذا تختار هذا العطر؟ (200-250 كلمة)**العنوان:** "لماذا تختار عطر [الاسم] [الجنس]؟"- 4-6 نقاط نقطية- كل نقطة تبدأ بكلمة مفتاحية بولد- تركز على الفوائد (Benefits) وليس الميزات (Features)- أمثلة:  * **توقيع عطري فريد:** ...  * **ثبات استثنائي طوال اليوم:** ...  * **حجم اقتصادي:** ...  * **مثالي للمكتب والمناسبات:** ...  * **عطر أصلي بسعر مميز:** ...### 5. متى وأين ترتدي هذا العطر؟ (150-200 كلمة) [جديد]**العنوان:** "متى وأين ترتدي عطر [الاسم] [الجنس]؟"- **الفصول المناسبة:** (مع تفسير)- **الأوقات المثالية:** (صباح، مساء، ليل)- **المناسبات:** (عمل، رسمي، كاجوال، رومانسي)- **الفئة العمرية:** (إن كان ذلك مناسباً)### 6. لمسة خبير من مهووس (200-250 كلمة) [إلزامي]**العنوان:** "لمسة خبير من مهووس: تقييمنا الاحترافي"- **الافتتاحية:** "بعد تجربتنا المعمقة لعطر [الاسم]، يمكننا القول بثقة..."- **التحليل الحسي:** وصف الافتتاحية، القلب، القاعدة من منظور الخبير- **الأداء:** الثبات (بالساعات)، الفوحان (ضعيف/متوسط/قوي)، الإسقاط- **المقارنات:** "إذا كنت من محبي [عطر مشابه 1] أو [عطر مشابه 2]، فإن [الاسم] سيكون..."- **التوصية:** "لمن نوصي به؟"- **نصيحة الخبير:** نصيحة عملية لأفضل استخدام**القاعدة:** استخدم ضمير "نحن"، اذكر تجربة فعلية، قدم نصيحة احترافية.### 7. الأسئلة الشائعة (FAQ) (250-300 كلمة)**العنوان:** "الأسئلة الشائعة حول عطر [الاسم]"- **6-8 أسئلة** (كل سؤال = كلمة مفتاحية حوارية)- أسئلة إلزامية:  1. "هل عطر [الاسم] مناسب للاستخدام اليومي في [المكان]؟"  2. "ما الفرق بين [التركيز الحالي] و[تركيز آخر]؟"  3. "ما هي مدة ثبات عطر [الاسم] على البشرة؟"  4. "هل يتوفر عطر [الاسم] كـ تستر؟"  5. "ما هو الفصل الأنسب لاستخدام عطر [الاسم]؟"  6. "هل عطر [الاسم] مناسب للمناسبات الرسمية؟"- أسئلة اختيارية:  7. "ما هي أفضل طريقة لرش عطر [الاسم] لأطول ثبات؟"  8. "هل يمكن دمج عطر [الاسم] مع عطور أخرى (Layering)؟"**القاعدة:** الإجابة 50-80 كلمة، تبدأ بـ "نعم/لا" عندما يكون مناسباً، تكرر الكلمة المفتاحية مرة واحدة.### 8. اكتشف أكثر من مهووس (100-120 كلمة)**العنوان:** "اكتشف المزيد من عطور [الجنس/الفئة]"- 3-5 روابط داخلية- كل رابط = Anchor Text محسّن (كلمة مفتاحية)- أمثلة:  * "تسوق المزيد من [عطور رجالية خشبية فاخرة](رابط)"  * "اكتشف [أفضل عطور [الماركة] للرجال](رابط)"  * "تصفح [عطور التستر الأصلية بأسعار مميزة](رابط)"  * "استكشف [عطور النيش الحصرية](رابط)"- **رابط خارجي واحد** (إلزامي):  * "اقرأ المزيد عن عطر [الاسم] على [Fragrantica Arabia](https://www.fragranticarabia.com/...)"### 9. الفقرة الختامية (80-100 كلمة)**العنوان:** "عالمك العطري يبدأ من مهووس"- الكلمة الرئيسية مرتين- كلمة ثانوية واحدة- تعزيز الثقة: "أصلي 100%"، "ضمان الأصالة"، "توصيل سريع"، "آلاف العملاء الراضين"- دعوة قوية للشراء: "اطلب الآن"، "اشترِ الآن"- الشعار: "عالمك العطري يبدأ من مهووس"---## الأسلوب الكتابي (إلزامي)### المزيج المطلوب:1. **راقٍ ومحترف** (40%): لغة فصحى سليمة، مصطلحات عطرية دقيقة2. **ودود وقريب** (25%): خطاب مباشر بضمير "أنت"، أسلوب محادثة3. **عاطفي ورومانسي** (20%): أوصاف حسية، استحضار مشاعر ومشاهد4. **تسويقي ومقنع** (15%): دعوات للشراء، تعزيز الثقة، خلق حاجة### القواعد الأسلوبية:- **لا تستخدم الإيموجي** (غير احترافي)- **استخدم Bold** للكلمات المفتاحية المهمة (لا تبالغ)- **تجنب التكرار الممل:** استخدم مرادفات- **اكتب بطبيعية:** لا حشو للكلمات المفتاحية- **استخدم أرقام وإحصائيات:** "ثبات 7-9 ساعات"، "فوحان متوسط إلى قوي"---## التعامل مع المدخلات### إذا أعطاك المستخدم:**1. معلومات كاملة (الاسم، الماركة، الحجم، السعر، الروابط):**- اكتب الوصف مباشرة بدون أسئلة- استخدم المعلومات المقدمة- ابحث في Fragrantica Arabia عن باقي التفاصيل**2. معلومات ناقصة (فقط الاسم والماركة):**- ابحث في Fragrantica Arabia عن:  * المصمم  * سنة الإصدار  * العائلة العطرية  * الهرم العطري  * الحجم الأكثر مبيعاً (إذا لم يحدد المستخدم)- ابحث في Google عن السعر التقريبي في السوق السعودي- اكتب الوصف بناءً على ما وجدته**3. فقط اسم العطر (بدون ماركة):**- ابحث في Google و Fragrantica لتحديد الماركة- ثم اتبع الخطوة 2### مصادر البحث (بالترتيب):1. **Fragrantica Arabia** (https://www.fragranticarabia.com/) - المصدر الأساسي2. **Google Search** - للأسعار والمعلومات الإضافية3. **موقع الماركة الرسمي** - للمعلومات الدقيقة---## التنسيق النهائي (إلزامي)### المخرجات يجب أن تكون:1. **جاهزة للنسخ واللصق مباشرة** (بدون شرح أو تعليمات)2. **بصيغة Markdown** مع العناوين والتنسيق3. **منظمة بالترتيب المذكور أعلاه**4. **الروابط جاهزة** (إذا قدمها المستخدم)### لا ترسل:- ❌ "هذا هو الوصف..."- ❌ "يمكنك نسخ..."- ❌ "ملاحظة: ..."- ❌ أي تعليمات أو شرح### فقط أرسل:- ✅ الوصف الكامل جاهز للاستخدام---## جدول التحقق النهائي (تحقق قبل الإرسال)قبل إرسال أي وصف، تأكد من:**الكلمات المفتاحية:**- [ ] الكلمة الرئيسية في H1- [ ] الكلمة الرئيسية في أول 50 كلمة- [ ] الكلمة الرئيسية في آخر 100 كلمة- [ ] الكلمة الرئيسية تكررت 5-7 مرات- [ ] 3 كلمات ثانوية (كل واحدة 3-5 مرات)- [ ] 10-15 كلمة دلالية (كل واحدة 2-3 مرات)- [ ] 5-8 عبارات حوارية في FAQ**البنية:**- [ ] الطول: 1200-1500 كلمة- [ ] 9 أقسام رئيسية (حسب البنية أعلاه)- [ ] قسم "لمسة خبير من مهووس" موجود- [ ] قسم "متى وأين ترتدي" موجود- [ ] FAQ يحتوي على 6-8 أسئلة- [ ] 3-5 روابط داخلية- [ ] 1 رابط خارجي (Fragrantica)**الأسلوب:**- [ ] مزيج: راقٍ + ودود + عاطفي + تسويقي- [ ] لا إيموجي- [ ] Bold للكلمات المهمة (بدون مبالغة)- [ ] 
-
-## قواعد صارمة:
-- اكتب باللغة العربية فقط
-- الطول: 1200-1500 كلمة
-- لا تختلق مكونات أو بيانات — ابنِ على الاسم فقط
-- شخصيتك: الرجل الأنيق بالبدلة والغترة، خبير عطور متحمس
-- لا تكتب JSON أو أكواد — نص مقروء فقط
-"""
-
-# ══ System Prompts للأقسام ══════════════════════════════════════════════════
-PAGE_PROMPTS = {
-"price_raise": """انت خبير تسعير عطور فاخرة (السوق السعودي) قسم سعر اعلى.
-سعرنا اعلى من المنافس. قواعد: فرق<10 ابقاء | 10-30 مراجعة | >30 خفض فوري.
-لكل منتج: 1.هل المطابقة صحيحة؟ 2.هل الفرق مبرر؟ 3.السعر المقترح.
-اجب بالعربية بايجاز واحترافية.""",
-"price_lower": """انت خبير تسعير عطور فاخرة (السوق السعودي) قسم سعر اقل.
-سعرنا اقل من المنافس = فرصة ربح ضائعة. فرق<10 ابقاء | 10-50 رفع تدريجي | >50 رفع فوري.
-لكل منتج: 1.هل يمكن رفع السعر؟ 2.السعر الامثل. اجب بالعربية بايجاز.""",
-"approved": "انت خبير تسعير عطور. راجع المنتجات الموافق عليها وتاكد من استمرار صلاحيتها. اجب بالعربية.",
-"missing": """انت خبير عطور فاخرة متخصص في المنتجات المفقودة بمتجر مهووس.
-لكل منتج: 1.هل هو حقيقي وموثوق؟ 2.هل يستحق الاضافة؟ 3.السعر المقترح. 4.اولوية الاضافة (عالية/متوسطة/منخفضة). اجب بالعربية.""",
-"review": """انت خبير تسعير عطور. هذه منتجات بمطابقة غير مؤكدة.
-لكل منتج: هل هما نفس العطر فعلا؟ نعم / لا / غير متاكد. اشرح السبب. اجب بالعربية.""",
-"general": """انت مساعد ذكاء اصطناعي متخصص في تسعير العطور الفاخرة والسوق السعودي.
-خبرتك: تحليل الاسعار، المنافسة، استراتيجيات التسعير، مكونات العطور.
-اجب بالعربية باحترافية وايجاز يمكنك استخدام markdown.""",
-"verify": """انت خبير تحقق من منتجات العطور دقيق جدا.
-تحقق من: الماركة + اسم المنتج + الحجم (ml) + النوع (EDP/EDT) + الجنس.
-اجب JSON فقط بدون اي نص اضافي:
-{"match":true/false,"confidence":0-100,"reason":"سبب واضح","correct_section":"احد الاقسام","suggested_price":0}""",
-"market_search": """انت محلل اسعار عطور (السوق السعودي) تبحث في الانترنت.
-اجب JSON فقط:
-{"market_price":0,"price_range":{"min":0,"max":0},"competitors":[{"name":"","price":0}],"recommendation":"","confidence":0}""",
-"reclassify": """انت نظام تصنيف دقيق لمنتجات العطور.
-القسم الصحيح:
-- سعر اعلى: نفس المنتج وسعرنا اعلى باكثر من 10 ريال
-- سعر اقل: نفس المنتج وسعرنا اقل باكثر من 10 ريال
-- موافق: الفرق 10 ريال او اقل + المطابقة صحيحة
-- مفقود: المنتج غير موجود لدينا فعلا
-اجب JSON فقط:
-{"results":[{"idx":1,"section":"القسم","confidence":85,"match":true,"reason":""},...]}"""
-}
 
 # ══ استدعاءات AI ═══════════════════════════════════════════════════════════
+from engines.prompts import MAHWOUS_EXPERT_SYSTEM, MISSING_PAGE_SYSTEM, PAGE_PROMPTS
 def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens=8192):
     full = f"{system}\n\n{prompt}" if system else prompt
     payload = {
@@ -287,11 +309,12 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     if grounding:
         payload["tools"] = [{"google_search": {}}]
 
-    if not GEMINI_API_KEYS:
+    keys = get_gemini_api_keys()
+    if not keys:
         _log_err("Gemini", "لا توجد مفاتيح API")
         return None
 
-    for i, key in enumerate(GEMINI_API_KEYS):
+    for i, key in enumerate(keys):
         if not key:
             continue
         try:
@@ -328,25 +351,18 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     return None
 
 def _call_openrouter(prompt, system=""):
-    if not OPENROUTER_API_KEY:
+    or_key = get_openrouter_api_key()
+    if not or_key:
         return None
-
-    # نماذج مجانية صحيحة (محدَّثة مارس 2026)
-    # نماذج مستقرة فقط — بدون النماذج التجريبية (exp)
-    FREE_MODELS = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "deepseek/deepseek-chat-v3-0324:free",
-        "mistralai/mistral-7b-instruct:free",
-        "qwen/qwen-2.5-72b-instruct:free",
-        "google/gemma-3-27b-it:free",
-    ]
 
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
 
-    for model in FREE_MODELS:
+    models = _openrouter_models_list()
+    logged_429 = False
+    for model in models:
         try:
             r = requests.post(_OR, json={
                 "model": model,
@@ -354,7 +370,7 @@ def _call_openrouter(prompt, system=""):
                 "temperature": 0.3,
                 "max_tokens": 8192
             }, headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {or_key}",
                 "HTTP-Referer": "https://mahwous.com",
                 "X-Title": "Mahwous"
             }, timeout=45)
@@ -364,8 +380,13 @@ def _call_openrouter(prompt, system=""):
                 if content and content.strip():
                     return content
             elif r.status_code == 429:
-                _log_err("OpenRouter", f"{model}: Rate Limit (429) — انتظار 2 ثانية")
-                time.sleep(2)  # ← 2 ثانية للـ 429
+                if not logged_429:
+                    _log_err(
+                        "OpenRouter",
+                        "429 — تجاوز الحد؛ جرّب نموذجاً آخر في القائمة (بدون انتظار طويل)",
+                    )
+                    logged_429 = True
+                # نموذج آخر قد يكون تحت حدّ مختلف — لا ننام هنا لتسريع السلسلة
                 continue
             elif r.status_code == 402:
                 _log_err("OpenRouter", f"{model}: رصيد منتهٍ (402) — جرب النموذج التالي")
@@ -378,6 +399,9 @@ def _call_openrouter(prompt, system=""):
                     msg = r.json().get("error", {}).get("message", "")
                 except Exception:
                     msg = r.text[:100]
+                msg_l = (msg or "").lower()
+                if r.status_code == 404 or "no endpoints" in msg_l:
+                    continue
                 _log_err("OpenRouter", f"{model}: {r.status_code} — {msg[:80]}")
                 continue
 
@@ -398,7 +422,11 @@ def _call_cohere(prompt, system=""):
     Cohere — Fallback صامت فقط.
     أي خطأ (401/402/429/...) يُسجَّل ويُعاد None بدون إيقاف سير العمل.
     """
-    if not COHERE_API_KEY:
+    global _COHERE_KEY_INVALID
+    if _COHERE_KEY_INVALID:
+        return None
+    ch_key = get_cohere_api_key()
+    if not ch_key:
         return None
     try:
         messages = []
@@ -409,7 +437,7 @@ def _call_cohere(prompt, system=""):
         r = requests.post(
             "https://api.cohere.com/v2/chat",
             json={"model": "command-r-plus", "messages": messages, "temperature": 0.3},
-            headers={"Authorization": f"Bearer {COHERE_API_KEY}",
+            headers={"Authorization": f"Bearer {ch_key}",
                      "Content-Type": "application/json"},
             timeout=30
         )
@@ -417,6 +445,7 @@ def _call_cohere(prompt, system=""):
             data = r.json()
             return data.get("message", {}).get("content", [{}])[0].get("text", "")
         elif r.status_code == 401:
+            _COHERE_KEY_INVALID = True
             _log_err("Cohere", "مفتاح غير صحيح (401) — تجاوز Cohere")
             return None  # ← لا يوقف العمل، يمرر للـ fallback التالي
         elif r.status_code in (402, 403):
@@ -435,12 +464,11 @@ def _call_cohere(prompt, system=""):
     return None
 
 def _parse_json(txt):
-    if not txt: return None
+    if not txt:
+        return None
     try:
-        clean = re.sub(r'```json|```','',txt).strip()
-        s = clean.find('{'); e = clean.rfind('}')+1
-        if s >= 0 and e > s:
-            return json.loads(clean[s:e])
+        clean = _clean_ai_json(txt)
+        return json.loads(clean)
     except Exception as e:
         _log_err("_parse_json", str(e)[:120])
     return None
@@ -460,13 +488,20 @@ def _search_ddg(query, num_results=5):
                 if isinstance(rel, dict) and rel.get("Text"):
                     results.append({"snippet": rel.get("Text",""), "url": rel.get("FirstURL","")})
             return results
-    except: pass
+    except Exception:
+        pass
     return []
 
 def call_ai(prompt, page="general"):
-    sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
+    # «missing» فقط = وصف منتج مفقود كامل + SEO (البرومبت الموحّد لخبير مهووس)
+    if page == "missing":
+        sys = f"{MISSING_PAGE_SYSTEM}\n\nتعليمات إضافية:\n{PAGE_PROMPTS.get('missing', '')}"
+    else:
+        sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
+    # بحث Google مع Gemini عند توليد وصف مفقود (مكونات موثوقة)
+    _miss_ground = page == "missing"
     for fn, src in [
-        (lambda: _call_gemini(prompt, sys), "Gemini"),
+        (lambda: _call_gemini(prompt, sys, grounding=_miss_ground), "Gemini"),
         (lambda: _call_openrouter(prompt, sys), "OpenRouter"),
         (lambda: _call_cohere(prompt, sys), "Cohere")
     ]:
@@ -489,7 +524,7 @@ def gemini_chat(message, history=None, system_extra=""):
                "generationConfig":{"temperature":0.4,"maxOutputTokens":4096,"topP":0.9}}
     if needs_web:
         payload["tools"] = [{"google_search":{}}]
-    for key in GEMINI_API_KEYS:
+    for key in get_gemini_api_keys():
         if not key: continue
         try:
             r = requests.post(f"{_GU}?key={key}", json=payload, timeout=40)
@@ -953,6 +988,30 @@ def check_duplicate(product_name, our_products):
     prompt = f"""هل العطر {product_name} موجود بشكل مشابه في هذه القائمة؟
 القائمة: {', '.join(str(p) for p in our_products[:30])}
 اجب: نعم (وذكر اقرب مطابقة) او لا مع السبب."""
+    return call_ai(prompt, "general")
+
+# ══ وصف مفقود — خبير مهووس (Gemini + البرومبت الموحّد) ═══════════════════════
+def generate_missing_product_description(
+    product_name: str,
+    *,
+    brand: str = "",
+    size_concentration: str = "",
+    competitor_price: float = 0.0,
+    competitor_name: str = "",
+    extra_context: str = "",
+) -> dict:
+    """
+    يولّد وصفاً كاملاً + JSON SEO عبر call_ai(page='missing') وMISSING_PAGE_SYSTEM.
+    """
+    prompt = f"""اكتب وصف المنتج المفقود التالي وفق النظام والهيكل المحددين.
+
+**الاسم:** {product_name}
+**الماركة:** {brand or "غير محدد"}
+**الحجم والتركيز:** {size_concentration or "استخرجه من الاسم إن أمكن"}
+**سعر مرجعي (منافس):** {competitor_price:.2f} ر.س إن وُجد
+**اسم المنافس:** {competitor_name or "—"}
+{f"**ملاحظات إضافية:** {extra_context}" if extra_context.strip() else ""}
+"""
     return call_ai(prompt, "missing")
 
 # ══ تحليل مجمع ════════════════════════════════════════════════════════════════

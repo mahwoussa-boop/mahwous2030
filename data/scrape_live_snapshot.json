@@ -4,11 +4,11 @@
   "success": false,
   "error": null,
   "scrape": {
-    "current": 1740,
+    "current": 1082,
     "total": 5678,
-    "label": "🏪 متجر 1/18 | 🕸️ 1740/5678 | جاري البحث...",
-    "elapsed_sec": 6584,
-    "urls_per_min": 15.9,
+    "label": "🏪 متجر 1/18 | 🕸️ 1082/5678 | جاري البحث...",
+    "elapsed_sec": 4239,
+    "urls_per_min": 15.3,
     "products_per_min": 0.0
   },
   "analysis": {
@@ -31,5 +31,5 @@
     "error": null,
     "pending_hydrate": false
   },
-  "updated_at": "2026-04-02T15:48:38.784887"
+  "updated_at": "2026-04-02T16:26:47.674629"
 }

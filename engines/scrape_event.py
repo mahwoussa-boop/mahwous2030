@@ -102,3 +102,22 @@ def maybe_append_ndjson_event(
     with _ndjson_lock:
         with open(out_path, "a", encoding="utf-8") as f:
             f.write(line)
+
+
+# ─── Real-Time Hook للربط مع المحرك ───
+_realtime_callback = None
+
+
+def register_realtime_hook(callback):
+    """ربط دالة خارجية (مثلاً من app.py أو engine.py) لتلقي الأحداث فوراً."""
+    global _realtime_callback
+    _realtime_callback = callback
+
+
+def trigger_realtime_event(ev: dict[str, Any]):
+    """يرسل الحدث للمستمع المسجل (التحليل الفوري)."""
+    if _realtime_callback:
+        try:
+            _realtime_callback(ev)
+        except Exception:
+            logger.exception("realtime hook callback failed")
