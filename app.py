@@ -941,15 +941,15 @@ def _dedupe_competitor_entries(entries: list[dict]) -> list[dict]:
 def load_preset_competitors() -> list[dict]:
     """قائمة المنافسين الثابتة من `data/preset_competitors.json` (اسم، متجر، sitemap)."""
     path = PRESET_COMPETITORS_PATH
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception:
-        return []
-    if not isinstance(raw, list):
-        return []
+    raw = None
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            raw = None
+    if not isinstance(raw, list) or not raw:
+        raw = list(PRESET_COMPETITORS_FALLBACK)
     out: list[dict] = []
     for item in raw:
         if not isinstance(item, dict):
