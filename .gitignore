@@ -6,3 +6,5 @@ data/scrape_events.ndjson
 .streamlit/secrets.toml
 .streamlit/secrets.toml
 API_SETUP.md
+.env
+.streamlit/secrets.toml
