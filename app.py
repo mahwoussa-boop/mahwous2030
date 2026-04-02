@@ -1264,16 +1264,9 @@ def _render_live_scrape_dashboard(snap: dict):
     c2.metric("🟢 سعر أقل", int(counts.get("price_lower", 0)))
     c3.metric("✅ موافق عليها", int(counts.get("approved", 0)))
     c4.metric("🔍 منتجات مفقودة", int(counts.get("missing", 0)))
-    with c5:
-            st.metric("⚠️ تحت المراجعة", int(counts.get("review", 0)))
-            if int(counts.get("review", 0)) > 0:
-                if st.button("🗑️ حذف النتائج الوهمية", key="del_fake_res_btn", help="تجاهل جميع المنتجات تحت المراجعة دفعة واحدة", use_container_width=True):
-                    mask = st.session_state.analysis_df['suggested_action'] == 'review'
-                    st.session_state.analysis_df.loc[mask, 'status'] = 'ignored'
-                    st.session_state.analysis_df.loc[mask, 'suggested_action'] = 'ignored'
-                    st.rerun()
+    c5.metric("⚠️ تحت المراجعة", int(counts.get("review", 0)))
     try:
-        _pe = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "3") or 3)
+        _pe = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100") or 100)
     except ValueError:
         _pe = 100
     if _pe <= 0:
@@ -2691,14 +2684,32 @@ with st.sidebar:
                     )
                 st.session_state.job_running = False
 
+    st.markdown("---")
+    try:
+        _nav_legacy_clicked = st.button(
+            "🛠️ التدقيق والتحسين",
+            key="nav_legacy_tools",
+            use_container_width=True,
+            type="tertiary",
+        )
+    except TypeError:
+        _nav_legacy_clicked = st.button(
+            "🛠️ التدقيق والتحسين",
+            key="nav_legacy_tools",
+            use_container_width=True,
+        )
+    if _nav_legacy_clicked:
+        st.session_state.legacy_tools_mode = True
+        st.rerun()
 
-
-    # التنقل نُقل للواجهة الرئيسية
-    # سنحتفظ فقط بقيمة افتراضية هنا تجنباً للأخطاء
-    page = st.session_state.get("sidebar_page_radio", "📊 لوحة التحكم")
+    page = st.radio(
+        "الأقسام",
+        SECTIONS,
+        label_visibility="collapsed",
+        key="sidebar_page_radio",
+    )
 
     st.markdown("---")
-    # تمت إزالة زر الحذف من الجانب
     if st.session_state.results:
         r = st.session_state.results
         st.markdown("**📊 ملخص:**")
@@ -2731,33 +2742,15 @@ with st.sidebar:
                     unsafe_allow_html=True)
 
 
-# (أدوات التدقيق تم دمجها بالأسفل)
-
-
 # ════════════════════════════════════════════════
-#  تصميم الواجهة الحديث (Premium Navigation)
+#  أدوات v11 المعزولة (مقارنة / مدقق متجر / SEO) — legacy_core + legacy_tools_dashboard
 # ════════════════════════════════════════════════
-st.markdown("<style>.stTabs > div[data-baseweb='tab-list'] { gap: 8px; }</style>", unsafe_allow_html=True)
+if st.session_state.get("legacy_tools_mode"):
+    from legacy_tools_dashboard import render_legacy_dashboard
 
-nav_groups = {
-    "🌐 الرئيسية": ["📊 لوحة التحكم", "📜 السجل", "✔️ تمت المعالجة"],
-    "🕸️ العمليات": ["📂 رفع الملفات", "➕ منتج سريع"],
-    "📊 التحليل والقرارات": ["🔴 سعر أعلى", "🟢 سعر أقل", "✅ موافق عليها", "🔍 منتجات مفقودة", "⚠️ تحت المراجعة"],
-    "🛠️ التدقيق والتحسين": ["🔀 المقارنة", "🏪 مدقق المتجر", "🔍 معالج السيو"],
-    "⚙️ الإعدادات والأتمتة": ["🔄 الأتمتة الذكية", "⚡ أتمتة Make", "🤖 الذكاء الصناعي", "⚙️ الإعدادات"]
-}
+    render_legacy_dashboard()
+    st.stop()
 
-# الملاحة الرئيسية (الفئات) بتصميم Tabs/Pills
-main_cat = st.segmented_control("الفئات الرئيسية", list(nav_groups.keys()), default="🌐 الرئيسية")
-if not main_cat:
-    main_cat = "🌐 الرئيسية"
-
-# الأقسام الفرعية التابعة للفئة المختارة
-page = st.pills("اختر القسم", nav_groups[main_cat], default=nav_groups[main_cat][0])
-if not page:
-    page = nav_groups[main_cat][0]
-
-st.markdown("---")
 
 # ════════════════════════════════════════════════
 #  1. لوحة التحكم
@@ -3157,7 +3150,7 @@ elif page == "📂 رفع الملفات":
                     ctx = {
                         "our_df": our_df_pre,
                         "pipeline_inline": True if scrape_bg else pipeline_inline,
-                        "pl_every": int(os.environ.get("SCRAPER_PIPELINE_EVERY", "3")),
+                        "pl_every": int(os.environ.get("SCRAPER_PIPELINE_EVERY", "100")),
                         "use_ai_partial": os.environ.get(
                             "SCRAPER_PIPELINE_AI_PARTIAL", ""
                         ).strip().lower()
@@ -4559,16 +4552,6 @@ elif page == "⚡ أتمتة Make":
 # ════════════════════════════════════════════════
 #  10. الإعدادات
 # ════════════════════════════════════════════════
-elif page == "🔀 المقارنة":
-    from legacy_tools_dashboard import render_compare_tab
-    render_compare_tab()
-elif page == "🏪 مدقق المتجر":
-    from legacy_tools_dashboard import render_store_audit_tab
-    render_store_audit_tab()
-elif page == "🔍 معالج السيو":
-    from legacy_tools_dashboard import render_seo_processor_tab
-    render_seo_processor_tab()
-
 elif page == "⚙️ الإعدادات":
     st.header("⚙️ الإعدادات")
     db_log("settings", "view")
@@ -4931,10 +4914,7 @@ elif page == "🔄 الأتمتة الذكية":
 
         if st.session_state.results and st.session_state.analysis_df is not None:
             adf = st.session_state.analysis_df
-            if "نسبة_التطابق" in adf.columns:
-                matched_df = adf[adf["نسبة_التطابق"].apply(lambda x: safe_float(x)) >= 85].copy()
-            else:
-                matched_df = pd.DataFrame()
+            matched_df = adf[adf["نسبة_التطابق"].apply(lambda x: safe_float(x)) >= 85].copy()
             st.info(f"📦 {len(matched_df)} منتج مؤكد المطابقة جاهز للتقييم التلقائي")
 
             col_a, col_b = st.columns(2)
