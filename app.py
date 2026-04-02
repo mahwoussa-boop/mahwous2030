@@ -28,9 +28,13 @@ import threading
 _logger = logging.getLogger(__name__)
 import time
 import uuid
-from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 from urllib.parse import urlparse
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
 
 from async_scraper import (
     merge_scraper_bg_state,
@@ -1200,6 +1204,70 @@ def _read_scrape_live_snapshot():
         return _read_scrape_live_snapshot_inner()
 
 
+def _live_ui_needs_refresh_ms():
+    """يحدّد إن كانت الواجهة بحاجة تحديث دوري (كشط/فرز/مهمة) والفاصل بالملّي ثانية."""
+    if os.environ.get("MAHWOUS_DISABLE_AUTOREFRESH", "").strip().lower() in ("1", "true", "yes"):
+        return None
+    intervals: list[int] = []
+    try:
+        snap = _read_scrape_live_snapshot()
+        if snap.get("running") and not snap.get("done"):
+            intervals.append(_ui_autorefresh_interval(2000))
+        if (snap.get("checkpoint_sort") or {}).get("active"):
+            intervals.append(_ui_autorefresh_interval(2000))
+    except Exception:
+        pass
+    try:
+        sbg = read_scraper_bg_state()
+        if sbg.get("active"):
+            intervals.append(_ui_autorefresh_interval(3000))
+    except Exception:
+        pass
+    try:
+        jid = st.session_state.get("job_id")
+        if jid:
+            job = get_job_progress(jid)
+            if job and job.get("status") == "running":
+                intervals.append(_ui_autorefresh_interval(4000))
+    except Exception:
+        pass
+    if not intervals:
+        return None
+    return min(intervals)
+
+
+def _trigger_live_ui_refresh_if_needed() -> None:
+    """
+    تحديث دوري عبر streamlit-autorefresh (يعيد تشغيل التطبيق فقط).
+    لا يُعاد تحميل الصفحة كاملة في المتصفح — كان يُسبب وميضاً شديداً عند استخدام location.reload().
+    """
+    if st_autorefresh is None:
+        return
+    ms = _live_ui_needs_refresh_ms()
+    if not ms:
+        return
+    try:
+        st_autorefresh(interval=ms, key="main_live_refresh")
+    except Exception:
+        pass
+
+
+def _safe_periodic_rerun(interval_ms: int, key: str) -> None:
+    """
+    اسم قديم — نسخ من app.py كانت تستدعيه بعد حذف نسخة location.reload.
+    يوجّه إلى streamlit-autorefresh فقط (لا وميض). يُفضّل استدعاء _trigger_live_ui_refresh_if_needed().
+    """
+    if st_autorefresh is None:
+        return
+    if os.environ.get("MAHWOUS_DISABLE_AUTOREFRESH", "").strip().lower() in ("1", "true", "yes"):
+        return
+    ms = max(1000, min(600_000, int(interval_ms)))
+    try:
+        st_autorefresh(interval=ms, key=key)
+    except Exception:
+        pass
+
+
 def _merge_scrape_live_snapshot(**kwargs):
     analysis_reset = kwargs.pop("analysis_reset", False)
     with _LIVE_SNAPSHOT_LOCK:
@@ -1729,13 +1797,6 @@ def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
                 _ck_live.get("phase") or "جاري الفرز…",
             )
             st.caption("⏳ يعمل في الخلفية دون تجميد الصفحة — راقب أيضاً الشريط الجانبي.")
-            try:
-                from streamlit_autorefresh import st_autorefresh
-
-                st_autorefresh(interval=_ui_autorefresh_interval(2000), key="checkpoint_recovery_panel_refresh")
-            except ImportError:
-                time.sleep(2)
-                st.rerun()
 
         if _ck_live.get("error") and not _ck_live.get("active"):
             st.error(f"❌ {_ck_live['error'][:400]}")
@@ -2750,16 +2811,9 @@ with st.sidebar:
                 )
             else:
                 st.session_state["_checkpoint_sort_user_flash"] = (False, f"⚠️ {err_sb}")
-            # لا st.rerun — يتعارض مع st_autorefresh ويمنع ظهور الرسالة
+            # لا st.rerun هنا — يتعارض مع تحديث الشريط ويمنع ظهور الرسالة
         if _n_sort_sb > 0:
             st.caption(f"📦 جاهز للفرز الفوري: **{_n_sort_sb:,}** منتج منافس")
-        try:
-            from streamlit_autorefresh import st_autorefresh
-
-            st_autorefresh(interval=_ui_autorefresh_interval(2500), key="sidebar_live_dual_refresh")
-        except ImportError:
-            time.sleep(2.5)
-            st.rerun()
     elif _sbg.get("active") and _sbg.get("phase") == "scrape":
         st.markdown(
             '<div style="background:#1565C022;border:1px solid #42A5F5;'
@@ -2779,13 +2833,6 @@ with st.sidebar:
             if _sbg.get("products_per_min"):
                 _ln += f" · ~{_sbg.get('products_per_min')} منتج/د"
             st.caption(_ln)
-        try:
-            from streamlit_autorefresh import st_autorefresh
-
-            st_autorefresh(interval=_ui_autorefresh_interval(3000), key="scrape_bg_refresh")
-        except ImportError:
-            time.sleep(3)
-            st.rerun()
 
     elif (not _live_run) and (_live_sb.get("checkpoint_sort") or {}).get("active"):
         st.markdown(
@@ -2802,13 +2849,6 @@ with st.sidebar:
         _an_ck = _live_sb.get("analysis") or {}
         if _an_ck.get("phase") and str(_an_ck.get("phase")) != "idle":
             st.caption(f"📊 {_an_ck.get('phase', '')} — {_an_ck.get('ai_mode', '')}")
-        try:
-            from streamlit_autorefresh import st_autorefresh
-
-            st_autorefresh(interval=_ui_autorefresh_interval(2000), key="sidebar_checkpoint_sort_refresh")
-        except ImportError:
-            time.sleep(2)
-            st.rerun()
 
     _ck_err = (_live_sb.get("checkpoint_sort") or {}).get("error")
     if _ck_err and not (_live_sb.get("checkpoint_sort") or {}).get("active"):
@@ -2827,14 +2867,6 @@ with st.sidebar:
                 pct = job["processed"] / max(job["total"], 1)
                 st.progress(min(pct, 0.99),
                             f"⚙️ {job['processed']}/{job['total']} منتج")
-                # تحديث تلقائي كل 4 ثوانٍ بدون إعادة تشغيل الكود كاملاً
-                try:
-                    from streamlit_autorefresh import st_autorefresh
-                    st_autorefresh(interval=_ui_autorefresh_interval(4000), key="progress_refresh")
-                except ImportError:
-                    # fallback: rerun عادي إذا لم تكن المكتبة موجودة
-                    time.sleep(4)
-                    st.rerun()
             elif job["status"] == "done" and st.session_state.job_running:
                 # اكتمل — حمّل النتائج تلقائياً مع استعادة القوائم
                 if job.get("results"):
@@ -3085,13 +3117,6 @@ elif page == "📂 رفع الملفات":
         with st.container(border=True):
             st.markdown("### 📡 مباشر — الكشط والتحليل على الدفعات")
             _render_live_scrape_dashboard(_snap_live)
-        try:
-            from streamlit_autorefresh import st_autorefresh
-
-            st_autorefresh(interval=_ui_autorefresh_interval(2000), key="scrape_live_dashboard_refresh")
-        except ImportError:
-            time.sleep(2)
-            st.rerun()
         st.markdown("---")
     elif _snap_live.get("done"):
         # يجب تحميل pickle قبل حذف اللقطة/الملفات — وإلا تُفقد النتائج إذا اكتمل الكشط أثناء الجلسة
@@ -5426,10 +5451,8 @@ AUTOMATION_RULES_DEFAULT.append({
 if "results" in st.session_state:
     _process_realtime_queue_main_thread()
 
-# تفعيل التحديث التلقائي إذا كان الكشط جارياً
-_snap_for_refresh = read_scraper_bg_state()
-if _snap_for_refresh.get("active") or _snap_for_refresh.get("phase") == "scrape":
-    st_autorefresh(interval=5000, key="scraper_ui_refresh")
+# تحديث دوري للصفحة عند الكشط/الفرز/المهام — بدون إعادة تحميل الصفحة كاملة (وميض)
+_trigger_live_ui_refresh_if_needed()
 
 # معالجة المنتجات السابقة تلقائياً إذا كانت الجلسة فارغة ويوجد نقطة حفظ
 if st.session_state.get("results") is None and not st.session_state.get("job_running"):
