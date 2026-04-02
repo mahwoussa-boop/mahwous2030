@@ -8,3 +8,4 @@ data/scrape_events.ndjson
 API_SETUP.md
 .env
 .streamlit/secrets.toml
+API_KEYS_REAL_DO_NOT_UPLOAD.txt
