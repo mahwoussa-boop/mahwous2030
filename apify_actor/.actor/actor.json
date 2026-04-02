@@ -1,0 +1,10 @@
+{
+    "actorSpecification": 1,
+    "name": "my-actor",
+    "title": "Universal JSON-LD store scraper",
+    "description": "Playwright + schema.org Product (JSON-LD) extraction from storefront URLs.",
+    "version": "0.0.5",
+    "buildTag": "latest",
+    "dockerfile": "../Dockerfile",
+    "input": "./input_schema.json"
+}

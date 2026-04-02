@@ -1,0 +1,26 @@
+{
+    "title": "Universal JSON-LD store scraper input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "startUrls": {
+            "title": "Start URLs",
+            "type": "array",
+            "description": "Store home, category, or product page URLs (Playwright loads each page and reads JSON-LD Product).",
+            "editor": "requestListSources",
+            "prefill": [{ "url": "https://example.com" }],
+            "items": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "title": "URL",
+                        "description": "Full https URL"
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    "required": ["startUrls"]
+}
