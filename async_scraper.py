@@ -645,10 +645,24 @@ def _load_sitemap_seeds() -> list[str]:
             if isinstance(x, str) and x.startswith("http"):
                 seeds.append(x.strip())
             elif isinstance(x, dict):
-                d = x.get("domain") or x.get("url")
+                # نفس مفاتيح preset_competitors.json / سياق الطابور — كان يُقرأ domain|url فقط فتُهمَل الجذور
+                d = (
+                    x.get("sitemap_url")
+                    or x.get("sitemap")
+                    or x.get("store_url")
+                    or x.get("url")
+                    or x.get("domain")
+                )
                 if isinstance(d, str) and d.startswith("http"):
                     seeds.append(d.strip())
-    return seeds
+    # إزالة التكرار مع الحفاظ على الترتيب
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in seeds:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 def _seeds_fingerprint(seeds: list[str]) -> str:
