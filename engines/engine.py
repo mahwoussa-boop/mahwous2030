@@ -11,7 +11,7 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
   3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62–96% (ومفاتيح متاحة)
   4. score ≥97% → تلقائي فوري  |  score <62% → لا مرشح | بدون API: عتبات 75/88
 """
-import re, io, json, hashlib, logging, sqlite3, time
+import re, io, json, hashlib, logging, sqlite3, threading, time
 from datetime import datetime
 from typing import Optional
 import pandas as pd
@@ -336,50 +336,77 @@ def _fuzzy_correct_brand(text: str, threshold: int = 82) -> str:
     return best_brand
 
 # ─── SQLite Cache ───────────────────────────
+# خيوط متعددة (كشط + تحليل) تضرب نفس الملف؛ WAL + قفل + timeout يمنعون database is locked
 _DB = "match_cache_v21.db"
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_connect():
+    cn = sqlite3.connect(_DB, timeout=30.0, check_same_thread=False)
+    try:
+        cn.execute("PRAGMA journal_mode=WAL")
+        cn.execute("PRAGMA synchronous=NORMAL")
+        cn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        logger.warning("match cache PRAGMA failed path=%s", _DB, exc_info=True)
+    return cn
+
+
 def _init_db():
     try:
-        cn = sqlite3.connect(_DB, check_same_thread=False)
+        cn = _cache_connect()
         cn.execute("CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, v TEXT, ts TEXT)")
-        cn.commit(); cn.close()
+        cn.commit()
+        cn.close()
     except Exception:
         logger.error("match cache DB init failed path=%s", _DB, exc_info=True)
 
+
 def _cget(k):
-    cn = None
-    try:
-        cn = sqlite3.connect(_DB, check_same_thread=False)
-        r = cn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
-        return json.loads(r[0]) if r else None
-    except Exception:
-        logger.error(
-            "match cache read failed key_prefix=%s",
-            (k[:32] + "…") if len(k) > 32 else k,
-            exc_info=True,
-        )
-        return None
-    finally:
-        if cn:
-            try: cn.close()
-            except Exception: pass
+    with _CACHE_LOCK:
+        cn = None
+        try:
+            cn = _cache_connect()
+            r = cn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
+            return json.loads(r[0]) if r else None
+        except Exception:
+            logger.error(
+                "match cache read failed key_prefix=%s",
+                (k[:32] + "…") if len(k) > 32 else k,
+                exc_info=True,
+            )
+            return None
+        finally:
+            if cn:
+                try:
+                    cn.close()
+                except Exception:
+                    pass
+
 
 def _cset(k, v):
-    cn = None
-    try:
-        cn = sqlite3.connect(_DB, check_same_thread=False)
-        cn.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",
-                   (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat()))
-        cn.commit()
-    except Exception:
-        logger.error(
-            "match cache write failed key_prefix=%s",
-            (k[:32] + "…") if len(k) > 32 else k,
-            exc_info=True,
-        )
-    finally:
-        if cn:
-            try: cn.close()
-            except Exception: pass
+    with _CACHE_LOCK:
+        cn = None
+        try:
+            cn = _cache_connect()
+            cn.execute(
+                "INSERT OR REPLACE INTO cache VALUES(?,?,?)",
+                (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat()),
+            )
+            cn.commit()
+        except Exception:
+            logger.error(
+                "match cache write failed key_prefix=%s",
+                (k[:32] + "…") if len(k) > 32 else k,
+                exc_info=True,
+            )
+        finally:
+            if cn:
+                try:
+                    cn.close()
+                except Exception:
+                    pass
+
 
 _init_db()
 
@@ -2084,17 +2111,17 @@ def smart_missing_barrier(
 
         if comp_sku and comp_sku in our_skus:
             continue
-        try:
-            fv = float(str(comp_sku).replace(",", ""))
-            if fv == int(fv) and str(int(fv)) in our_skus:
-                continue
-        except Exception:
-            logger.warning(
-                "find_missing_products: comp_sku float check failed comp_sku=%r comp_name=%r",
-                comp_sku,
-                comp_name[:80] if comp_name else "",
-                exc_info=True,
-            )
+        # SKU فارغ شائع من كشط المنافس؛ لا تستدعِ float('') — كان يرفع ValueError ويقطع الحاجز
+        if comp_sku:
+            try:
+                fv = float(str(comp_sku).replace(",", ""))
+                if fv == int(fv) and str(int(fv)) in our_skus:
+                    continue
+            except (ValueError, TypeError):
+                logger.debug(
+                    "smart_missing_barrier: comp_sku not numeric comp_sku=%r",
+                    comp_sku[:80] if comp_sku else "",
+                )
 
         if our_names and comp_name:
             match = rf_process.extractOne(
