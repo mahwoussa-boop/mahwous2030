@@ -1,4 +1,4 @@
-﻿"""
+"""
 engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
 ═══════════════════════════════════════════════════════
 🚀 تطبيع مسبق (Pre-normalize) → vectorized cdist → Gemini للغموض فقط
@@ -8,76 +8,79 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
 الخطة:
   1. عند رفع الملف → تطبيع كل منتجات المنافس مرة واحدة (cache)
   2. لكل منتجنا → cdist vectorized دفعة واحدة (بدل loop)
-  3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62–96% (ومفاتيح متاحة)
-  4. score ≥97% → تلقائي فوري  |  score <62% → لا مرشح | بدون API: عتبات 75/88
+  3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62-96%
+  4. score ≥97% → تلقائي فوري  |  score <62% → مفقود
 """
-import re, io, json, hashlib, logging, sqlite3, time
+import re, io, json, hashlib, sqlite3, time
 from datetime import datetime
-from typing import Optional
 import pandas as pd
 from rapidfuzz import fuzz, process as rf_process
 from rapidfuzz.distance import Indel
 import requests as _req
 
-logger = logging.getLogger(__name__)
-
-
-def _clean_ai_json(text: str) -> str:
-    """
-    يهيّئ نص الـ LLM للتحليل بـ json.loads: يزيل سياج markdown ويستخرج أول كائن/مصفوفة JSON.
-    إن تعذّر العثور على أقواس صالحة، يُعاد النص الأصلي ليحاول المتصل الفشل بشكل طبيعي.
-    """
-    if not isinstance(text, str):
-        return ""
-    original = text
-    t = re.sub(r"```\w*", "", text, flags=re.IGNORECASE)
-    t = t.replace("```", "")
-    t = t.strip()
-    i_arr = t.find("[")
-    i_obj = t.find("{")
-    if i_arr < 0 and i_obj < 0:
-        return original.strip()
-    if i_arr >= 0 and (i_obj < 0 or i_arr < i_obj):
-        start, end = i_arr, t.rfind("]")
-    else:
-        start, end = i_obj, t.rfind("}")
-    if start < 0 or end < 0 or end <= start:
-        return original.strip()
-    return t[start : end + 1].strip()
-
-
 try:
-    from engines.mahwous_core import apply_strict_pipeline_filters, tag_missing_volume_status
+    from engines.mahwous_core import apply_strict_pipeline_filters
 except ImportError:
-    from mahwous_core import apply_strict_pipeline_filters, tag_missing_volume_status
+    from mahwous_core import apply_strict_pipeline_filters
 
 try:
-    from config import AUTO_DECISION_CONFIDENCE, SMART_MISSING_FUZZ_THRESHOLD
+    from config import AUTO_DECISION_CONFIDENCE
 except Exception:
-    logger.error(
-        "config AUTO_DECISION_CONFIDENCE / SMART_MISSING_FUZZ_THRESHOLD import failed; using defaults",
-        exc_info=True,
-    )
     AUTO_DECISION_CONFIDENCE = 92
-    SMART_MISSING_FUZZ_THRESHOLD = 88
-
-# أقل عتبة لمطابقة ذات معنى (منطقة Gemini 62–96%؛ أقل من ذلك → لا مرشح / مفقود بدون API)
-MATCH_MIN_SCORE = 62
 
 # ─── استيراد الإعدادات ───────────────────────
 try:
     from config import (REJECT_KEYWORDS, KNOWN_BRANDS, WORD_REPLACEMENTS,
                         MATCH_THRESHOLD, HIGH_CONFIDENCE, REVIEW_THRESHOLD,
                         PRICE_TOLERANCE, TESTER_KEYWORDS, SET_KEYWORDS,
-                        GEMINI_API_KEYS, get_openrouter_api_key)
-except Exception:
-    logger.error(
-        "config import failed; using bundled defaults for REJECT_KEYWORDS/KNOWN_BRANDS/etc.",
-        exc_info=True,
-    )
-    from engines.match_rules import REJECT_KEYWORDS, KNOWN_BRANDS, WORD_REPLACEMENTS, MATCH_THRESHOLD, HIGH_CONFIDENCE, REVIEW_THRESHOLD, PRICE_TOLERANCE, TESTER_KEYWORDS, SET_KEYWORDS
-    def get_openrouter_api_key():
-        return ""
+                        GEMINI_API_KEYS, OPENROUTER_API_KEY)
+except:
+    REJECT_KEYWORDS = ["sample","عينة","عينه","decant","تقسيم","split","miniature"]
+    KNOWN_BRANDS = [
+        "Dior","Chanel","Gucci","Tom Ford","Versace","Armani","YSL","Prada","Burberry",
+        "Hermes","Creed","Montblanc","Amouage","Rasasi","Lattafa","Arabian Oud","Ajmal",
+        "Al Haramain","Afnan","Armaf","Mancera","Montale","Kilian","Jo Malone",
+        "Carolina Herrera","Paco Rabanne","Mugler","Ralph Lauren","Parfums de Marly",
+        "Nishane","Xerjoff","Byredo","Le Labo","Roja","Narciso Rodriguez",
+        "Dolce & Gabbana","Valentino","Bvlgari","Cartier","Hugo Boss","Calvin Klein",
+        "Givenchy","Lancome","Guerlain","Jean Paul Gaultier","Issey Miyake","Davidoff",
+        "Coach","Michael Kors","Initio","Memo Paris","Maison Margiela","Diptyque",
+        "Missoni","Juicy Couture","Moschino","Dunhill","Bentley","Jaguar",
+        "Boucheron","Chopard","Elie Saab","Escada","Ferragamo","Fendi",
+        "Kenzo","Lacoste","Loewe","Rochas","Roberto Cavalli","Tiffany",
+        "Van Cleef","Azzaro","Chloe","Elizabeth Arden","Swiss Arabian",
+        "Penhaligons","Clive Christian","Floris","Acqua di Parma",
+        "Ard Al Zaafaran","Nabeel","Asdaaf","Maison Alhambra",
+        "Tiziana Terenzi","Maison Francis Kurkdjian","Serge Lutens",
+        "Frederic Malle","Ormonde Jayne","Zoologist","Tauer",
+        "Banana Republic","Benetton","Bottega Veneta","Celine","Dsquared2",
+        "Ermenegildo Zegna","Sisley","Mexx","Amadou","Thameen",
+        "Nasomatto","Nicolai","Replica","Atelier Cologne","Aerin",
+        "Angel Schlesser","Annick Goutal","Antonio Banderas","Balenciaga",
+        "Bond No 9","Boadicea","Carner Barcelona","Clean","Commodity",
+        "Costume National","Creed","Derek Lam","Diptique","Estee Lauder",
+        "Franck Olivier","Giorgio Beverly Hills","Guerlain","Guess",
+        "Histoires de Parfums","Illuminum","Jimmy Choo","Kenneth Cole",
+        "Lalique","Lolita Lempicka","Lubin","Miu Miu","Moresque",
+        "Nobile 1942","Oscar de la Renta","Oud Elite","Philipp Plein",
+        "Police","Prada","Rasasi","Reminiscence","Salvatore Ferragamo",
+        "Stella McCartney","Ted Lapidus","Ungaro","Vera Wang","Viktor Rolf",
+        "Zadig Voltaire","Zegna","Ajwad","Club de Nuit","Milestone",
+        "لطافة","العربية للعود","رصاسي","أجمل","الحرمين","أرماف",
+        "أمواج","كريد","توم فورد","ديور","شانيل","غوتشي","برادا",
+        "ميسوني","جوسي كوتور","موسكينو","دانهيل","بنتلي",
+        "كينزو","لاكوست","فندي","ايلي صعب","ازارو",
+        "كيليان","نيشان","زيرجوف","بنهاليغونز","مارلي","جيرلان",
+        "تيزيانا ترينزي","مايزون فرانسيس","بايريدو","لي لابو",
+        "مانسيرا","مونتالي","روجا","جو مالون","ثمين","أمادو",
+        "ناسوماتو","ميزون مارجيلا","نيكولاي",
+        "جيمي تشو","لاليك","بوليس","فيكتور رولف",
+        "كلوي","بالنسياغا","ميو ميو",
+    ]
+WORD_REPLACEMENTS = {}
+MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
+PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
+OPENROUTER_API_KEY = ""
 
 # ─── قراءة مفاتيح Gemini من Railway Environment Variables ───
 import os as _os
@@ -92,11 +95,8 @@ def _load_gemini_keys():
         k = _os.environ.get(f"GEMINI_KEY_{i}", "")
         if k.strip():
             keys.append(k.strip())
-    # طريقة 3: أسماء بديلة (يشمل أسماء Google / Railway)
-    for env_name in [
-        "GEMINI_API_KEY", "GEMINI_KEY", "GOOGLE_API_KEY",
-        "GOOGLE_AI_API_KEY", "GENERATIVE_AI_API_KEY",
-    ]:
+    # طريقة 3: أسماء بديلة
+    for env_name in ["GEMINI_API_KEY", "GEMINI_KEY"]:
         k = _os.environ.get(env_name, "")
         if k.strip():
             keys.append(k.strip())
@@ -112,13 +112,164 @@ try:
             dict.fromkeys(list(GEMINI_API_KEYS or []) + list(_cfg_keys))
         )
 except Exception:
-    logger.warning(
-        "merge GEMINI_API_KEYS from config failed (step=config merge)",
-        exc_info=True,
-    )
+    pass
 
 # ─── مرادفات ذكية للعطور ────────────────────
-from engines.match_rules import _SYN, _NOISE_RE, _CAP_VOL_RE, _BUNDLE_KW_RE
+_SYN = {
+    "eau de parfum":"edp","او دو بارفان":"edp","أو دو بارفان":"edp",
+    "او دي بارفان":"edp","بارفان":"edp","parfum":"edp","perfume":"edp",
+    "eau de toilette":"edt","او دو تواليت":"edt","أو دو تواليت":"edt",
+    "تواليت":"edt","toilette":"edt","toilet":"edt",
+    "eau de cologne":"edc","كولون":"edc","cologne":"edc",
+    "extrait de parfum":"extrait","parfum extrait":"extrait",
+    "ديور":"dior","شانيل":"chanel","شنل":"chanel","أرماني":"armani","ارماني":"armani",
+    "جورجيو ارماني":"armani","فرساتشي":"versace","فيرساتشي":"versace",
+    "غيرلان":"guerlain","توم فورد":"tom ford","تومفورد":"tom ford",
+    "لطافة":"lattafa","لطافه":"lattafa",
+    "أجمل":"ajmal","رصاصي":"rasasi","أمواج":"amouage","كريد":"creed",
+    "ايف سان لوران":"ysl","سان لوران":"ysl","yves saint laurent":"ysl",
+    "غوتشي":"gucci","قوتشي":"gucci","برادا":"prada","برادة":"prada",
+    "بربري":"burberry","بيربري":"burberry","جيفنشي":"givenchy","جفنشي":"givenchy",
+    "كارولينا هيريرا":"carolina herrera","باكو رابان":"paco rabanne",
+    "نارسيسو رودريغيز":"narciso rodriguez","كالفن كلاين":"calvin klein",
+    "هوجو بوس":"hugo boss","فالنتينو":"valentino","بلغاري":"bvlgari",
+    "كارتييه":"cartier","لانكوم":"lancome","جو مالون":"jo malone",
+    "سوفاج":"sauvage","بلو":"bleu","إيروس":"eros","ايروس":"eros",
+    "وان ميليون":"1 million",
+    "إنفيكتوس":"invictus","أفينتوس":"aventus","عود":"oud","مسك":"musk",
+    "ميسوني":"missoni","جوسي كوتور":"juicy couture","موسكينو":"moschino",
+    "دانهيل":"dunhill","بنتلي":"bentley","كينزو":"kenzo","لاكوست":"lacoste",
+    "فندي":"fendi","ايلي صعب":"elie saab","ازارو":"azzaro",
+    "فيراغامو":"ferragamo","شوبار":"chopard","بوشرون":"boucheron",
+    "لانكم":"lancome","لانكوم":"lancome","جيفنشي":"givenchy","جيفانشي":"givenchy",
+    "بربري":"burberry","بيربري":"burberry","بوربيري":"burberry",
+    "فيرساتشي":"versace","فرزاتشي":"versace",
+    "روبيرتو كفالي":"roberto cavalli","روبرتو كافالي":"roberto cavalli",
+    "سلفاتوري":"ferragamo","سالفاتوري":"ferragamo",
+    "ايف سان لوران":"ysl","ايف سانت لوران":"ysl",
+    "هيرميس":"hermes","ارميس":"hermes","هرمز":"hermes",
+    "كيليان":"kilian","كليان":"kilian",
+    "نيشان":"nishane","نيشاني":"nishane",
+    "زيرجوف":"xerjoff","زيرجوفف":"xerjoff",
+    "بنهاليغونز":"penhaligons","بنهاليغون":"penhaligons",
+    "مارلي":"parfums de marly","دي مارلي":"parfums de marly",
+    "جيرلان":"guerlain","غيرلان":"guerlain","جرلان":"guerlain",
+    "تيزيانا ترينزي":"tiziana terenzi","تيزيانا":"tiziana terenzi",
+    "ناسوماتو":"nasomatto",
+    "ميزون مارجيلا":"maison margiela","مارجيلا":"maison margiela","ربليكا":"replica",
+    "نيكولاي":"nicolai","نيكولائي":"nicolai",
+    "مايزون فرانسيس":"maison francis kurkdjian","فرانسيس":"maison francis kurkdjian",
+    "بايريدو":"byredo","لي لابو":"le labo",
+    "مانسيرا":"mancera","مونتالي":"montale","روجا":"roja",
+    "جو مالون":"jo malone","جومالون":"jo malone",
+    "ثمين":"thameen","أمادو":"amadou","امادو":"amadou",
+    "انيشيو":"initio","إنيشيو":"initio","initio":"initio",
+    "جيمي تشو":"jimmy choo","جيميتشو":"jimmy choo",
+    "لاليك":"lalique","بوليس":"police",
+    "فيكتور رولف":"viktor rolf","فيكتور اند رولف":"viktor rolf",
+    "كلوي":"chloe","شلوي":"chloe",
+    "بالنسياغا":"balenciaga","بالنسياجا":"balenciaga",
+    "ميو ميو":"miu miu",
+    "استي لودر":"estee lauder","استيلودر":"estee lauder",
+    "كوتش":"coach","مايكل كورس":"michael kors",
+    "رالف لورين":"ralph lauren","رالف لوران":"ralph lauren",
+    "ايزي مياكي":"issey miyake","ايسي مياكي":"issey miyake",
+    "دافيدوف":"davidoff","ديفيدوف":"davidoff",
+    "دولشي اند غابانا":"dolce gabbana","دولتشي":"dolce gabbana","دولشي":"dolce gabbana",
+    "جان بول غولتييه":"jean paul gaultier","غولتييه":"jean paul gaultier","غولتيه":"jean paul gaultier",
+    "غوتييه":"jean paul gaultier","جان بول غوتييه":"jean paul gaultier","قوتييه":"jean paul gaultier","قولتييه":"jean paul gaultier",
+    "مونت بلانك":"montblanc","مونتبلان":"montblanc",
+    "موجلر":"mugler","موغلر":"mugler","تييري موجلر":"mugler",
+    "كلوب دي نوي":"club de nuit","كلوب دنوي":"club de nuit",
+    "مايلستون":"milestone",
+    "سكاندل":"scandal","سكاندال":"scandal",
+    " مل":" ml","ملي ":"ml ","ملي":"ml","مل":"ml",
+    "ليتر":"l","لتر":"l"," لتر":" l"," ليتر":" l",
+    "جم":"g","جرام":"g"," غرام":" g",
+    # ── توحيد الحروف العربية ──
+    "أ":"ا","إ":"ا","آ":"ا","ة":"ه","ى":"ي","ؤ":"و","ئ":"ي","ـ":"",
+    # ── تهجئات بديلة لكلمات العطور (الأهم للمطابقة) ──
+    "بيرفيوم":"edp","بيرفيومز":"edp","بارفيومز":"edp","برفان":"edp",
+    "پارفيوم":"edp","پرفيوم":"edp","بارفيم":"edp",
+    "تواليت":"edt","تواليتة":"edt","طواليت":"edt",
+    "اكسترايت":"extrait","اكستريت":"extrait","اكسترييت":"extrait",
+    "انتينس":"intense","انتانس":"intense","إنتنس":"intense",
+    # ── تهجئات الماركات الإضافية ──
+    "ايسينشيال":"essential","اسنشيال":"essential","ايسانشيال":"essential",
+    "اسنشال":"essential","ايسنشال":"essential","ايسينشال":"essential",
+    "سولييل":"soleil","سولايل":"soleil","سوليل":"soleil",
+    "فلورال":"floral","فلورل":"floral","فلوريل":"floral",
+    "سوفاج":"sauvage","سوفايج":"sauvage","سافاج":"sauvage",
+    "بلو":"bleu","بلوو":"bleu",
+    "ليبر":"libre","ليبرة":"libre",
+    "اوريجينال":"original","أوريجينال":"original",
+    "إكسترا":"extra","اكسترا":"extra",
+    "انفيوجن":"infusion","انفيجن":"infusion","انفيوزن":"infusion",
+    "ديليت":"delight","ديلايت":"delight",
+    "نيوتر":"neutre","نيوتره":"neutre","نيوتير":"neutre",
+    "بيور":"pure","بيوره":"pure","بيورة":"pure",
+    "نوار":"noir","نوير":"noir",
+    "روز":"rose","روس":"rose",
+    "جاسمين":"jasmine","جازمين":"jasmine","ياسمين":"jasmine",
+    "ميلانجي":"melange","ميلانج":"melange",
+    "بريلوج":"prelude","برولوج":"prelude",
+    "ريزيرف":"reserve","ريزيرفي":"reserve",
+    "اميثست":"amethyst","اميثيست":"amethyst",
+    "دراكار":"drakkar","دراكر":"drakkar",
+    "نمروود":"nimrod","نمرود":"nimrod",
+    "اوليفيا":"olivia","اوليفيه":"olivia",
+    "ليجند":"legend","ليجاند":"legend",
+    "سبورت":"sport","سبورتس":"sport",
+    "بلاك":"black","بلك":"black",
+    "وايت":"white","وايث":"white",
+    "جولد":"gold","قولد":"gold",
+    "سيلفر":"silver","سيلفير":"silver",
+    "نايت":"night","نايث":"night",
+    "داي":"day","دي":"day",
+    "او":"",  # إزالة حروف الربط الزائدة
+    # ── v26.0: مرادفات إضافية لزيادة الدقة ──
+    # أحجام بديلة
+    "٥٠":"50","٧٥":"75","١٠٠":"100","١٢٥":"125","١٥٠":"150","٢٠٠":"200",
+    "٢٥٠":"250","٣٠٠":"300","٣٠":"30","٨٠":"80",
+    # تركيزات إضافية
+    "بارفيوم انتنس":"edp intense","انتنس":"intense","إنتنس":"intense",
+    "ابسولو":"absolue","ابسوليو":"absolue","ابسوليوت":"absolute",
+    "اكستريم":"extreme","اكسترييم":"extreme",
+    "بريفيه":"prive","بريفي":"prive","privee":"prive","privé":"prive",
+    "ليجير":"legere","ليجيره":"legere","légère":"legere",
+    # ماركات ناقصة
+    "توماس كوسمالا":"thomas kosmala","كوسمالا":"thomas kosmala",
+    "روسيندو ماتيو":"rosendo mateu","ماتيو":"rosendo mateu",
+    "بوديسيا":"boadicea","بواديسيا":"boadicea",
+    "نوبيلي":"nobile","نوبيل":"nobile",
+    "كارنر":"carner","كارنير":"carner",
+    "اتيليه كولون":"atelier cologne","اتيليه":"atelier",
+    "بوند نمبر ناين":"bond no 9","بوند":"bond",
+    "هيستوار":"histoires","هيستوريز":"histoires",
+    "لوبين":"lubin","لوبان":"lubin",
+    "فيليب بلين":"philipp plein","فيلب بلين":"philipp plein",
+    "اوسكار دي لا رنتا":"oscar de la renta","اوسكار":"oscar",
+    "ستيلا مكارتني":"stella mccartney","ستيلا":"stella",
+    "زاديغ":"zadig","زاديج":"zadig",
+    "تيد لابيدوس":"ted lapidus","لابيدوس":"ted lapidus",
+    "انقارو":"ungaro","اونغارو":"ungaro",
+    "فيرا وانق":"vera wang","فيرا وانغ":"vera wang",
+    "كينيث كول":"kenneth cole","كينث كول":"kenneth cole",
+    "اد هاردي":"ed hardy","ايد هاردي":"ed hardy",
+    # كلمات عطرية شائعة
+    "عنبر":"amber","عنبري":"amber","امبر":"amber",
+    "عود":"oud","عودي":"oud",
+    "مسك":"musk","مسكي":"musk",
+    "زعفران":"saffron","زعفراني":"saffron",
+    "بخور":"incense","بخوري":"incense",
+    "فانيلا":"vanilla","فانيليا":"vanilla",
+    "باتشولي":"patchouli","باتشولي":"patchouli",
+    "صندل":"sandalwood","صندلي":"sandalwood",
+    "توباكو":"tobacco","تبغ":"tobacco",
+    # تصحيح إملائي شائع
+    "بيرفوم":"edp","بريفيوم":"edp","بارفوم":"edp",
+    "تولت":"edt","تويلت":"edt",
+}
 
 # ─── v26.0: Fuzzy Spell Correction ────────────────
 def _fuzzy_correct_brand(text: str, threshold: int = 82) -> str:
@@ -143,132 +294,24 @@ def _init_db():
         cn = sqlite3.connect(_DB, check_same_thread=False)
         cn.execute("CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, v TEXT, ts TEXT)")
         cn.commit(); cn.close()
-    except Exception:
-        logger.error("match cache DB init failed path=%s", _DB, exc_info=True)
+    except: pass
 
 def _cget(k):
-    cn = None
     try:
         cn = sqlite3.connect(_DB, check_same_thread=False)
         r = cn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
-        return json.loads(r[0]) if r else None
-    except Exception:
-        logger.error(
-            "match cache read failed key_prefix=%s",
-            (k[:32] + "…") if len(k) > 32 else k,
-            exc_info=True,
-        )
-        return None
-    finally:
-        if cn:
-            try: cn.close()
-            except Exception: pass
+        cn.close(); return json.loads(r[0]) if r else None
+    except: return None
 
 def _cset(k, v):
-    cn = None
     try:
         cn = sqlite3.connect(_DB, check_same_thread=False)
         cn.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",
                    (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat()))
-        cn.commit()
-    except Exception:
-        logger.error(
-            "match cache write failed key_prefix=%s",
-            (k[:32] + "…") if len(k) > 32 else k,
-            exc_info=True,
-        )
-    finally:
-        if cn:
-            try: cn.close()
-            except Exception: pass
+        cn.commit(); cn.close()
+    except: pass
 
 _init_db()
-
-
-def _gemini_keys_available() -> bool:
-    """True إذا وُجد مفتاح Gemini صالح لاستدعاء API."""
-    for k in GEMINI_API_KEYS or []:
-        if k and str(k).strip():
-            return True
-    return False
-
-
-def _no_api_strong_signals(
-    product: str,
-    brand: str,
-    size: float,
-    our_pline: str,
-    best0: dict,
-) -> bool:
-    """
-    عتبة 88% حتى <97%: موافقة تلقائية بدون API فقط عند ماركة + حجم + خط إنتاج متوافقين.
-    (لا يمس normalize_name / extract_product_line — يستدعيها فقط.)
-    """
-    sc = float(best0.get("score") or 0)
-    if not (88 <= sc < 97):
-        return False
-    cname = str(best0.get("name") or "")
-    c_br = best0.get("brand") or extract_brand(cname)
-    c_sz = float(best0.get("size") or 0)
-    our_sz = float(size or 0)
-    if brand and c_br and normalize(brand) != normalize(c_br):
-        return False
-    if our_sz > 0 and c_sz > 0:
-        d = abs(our_sz - c_sz)
-        if d > 30:
-            return False
-        if d > 5:
-            return False
-    c_pl = extract_product_line(cname, c_br) if c_br else extract_product_line(cname, extract_brand(cname))
-    if our_pline and c_pl:
-        if fuzz.token_sort_ratio(our_pline, c_pl) < 88:
-            return False
-    elif (our_pline and not c_pl) or (not our_pline and c_pl):
-        return False
-    return True
-
-
-def _no_api_resolve_row(
-    product: str,
-    our_price: float,
-    our_id: str,
-    brand: str,
-    size: float,
-    ptype: str,
-    gender: str,
-    our_pline: str,
-    best0: dict,
-    all_cands: list,
-    our_img: str,
-):
-    """
-    وضع بدون API: 62–74 → لا صف (مفقود من ناحية المطابقة) | 75–87 → review_no_api |
-    88–96.99 قوي → auto_no_api عند الإشارات القوية وإلا مراجعة.
-    """
-    sc = float(best0.get("score") or 0)
-    if sc < MATCH_MIN_SCORE:
-        return None
-    if MATCH_MIN_SCORE <= sc < 75:
-        return None
-    if 75 <= sc < 88:
-        return _row(
-            product, our_price, our_id, brand, size, ptype, gender,
-            best0, override="⚠️ تحت المراجعة", src="review_no_api",
-            all_cands=all_cands, our_img=our_img,
-        )
-    if 88 <= sc < 97:
-        if _no_api_strong_signals(product, brand, size, our_pline, best0):
-            return _row(
-                product, our_price, our_id, brand, size, ptype, gender,
-                best0, src="auto_no_api", all_cands=all_cands, our_img=our_img,
-            )
-        return _row(
-            product, our_price, our_id, brand, size, ptype, gender,
-            best0, override="⚠️ تحت المراجعة", src="review_no_api",
-            all_cands=all_cands, our_img=our_img,
-        )
-    return None
-
 
 # ─── دوال أساسية ────────────────────────────
 def read_file(f):
@@ -282,14 +325,7 @@ def read_file(f):
                     df = pd.read_csv(f, encoding=enc, on_bad_lines='skip')
                     if len(df) > 0 and not df.columns[0].startswith('\ufeff'): 
                         break
-                except Exception:
-                    logger.warning(
-                        "read_file CSV parse step failed encoding=%s file=%s",
-                        enc,
-                        getattr(f, "name", "?"),
-                        exc_info=True,
-                    )
-                    continue
+                except: continue
             if df is None:
                 return None, "فشل قراءة الملف بجميع الترميزات"
         elif name.endswith(('.xlsx','.xls')):
@@ -305,11 +341,6 @@ def read_file(f):
         df = _smart_rename_columns(df)
         return df, None
     except Exception as e:
-        logger.error(
-            "read_file failed file=%s",
-            getattr(f, "name", "?"),
-            exc_info=True,
-        )
         return None, str(e)
 
 
@@ -356,16 +387,10 @@ def _smart_rename_columns(df):
                 try:
                     float(str(v).replace(',', ''))
                     numeric_count += 1
-                except Exception:
-                    logger.warning(
-                        "_smart_rename_columns: numeric probe failed col=%r sample_val=%r",
-                        col,
-                        v,
-                        exc_info=True,
-                    )
+                except:
+                    pass
             if numeric_count >= len(sample) * 0.7:
-                if 'السعر' not in new_cols.values():
-                    new_cols[col] = 'السعر'
+                new_cols[col] = 'السعر'
             else:
                 # يحتوي على نصوص → اسم المنتج
                 if 'المنتج' not in new_cols.values() and 'اسم المنتج' not in new_cols.values():
@@ -377,6 +402,19 @@ def _smart_rename_columns(df):
     return df
 
 # ── كلمات الضجيج التي تُشوّش المطابقة ──────────────────────────────
+_NOISE_RE = re.compile(
+    r'\b(عطر|تستر|تيستر|tester|'
+    r'بارفيوم|بيرفيوم|بارفيومز|بيرفيومز|برفيوم|برفان|بارفان|بارفيم|'
+    r'تواليت|تواليتة|كولون|اكسترايت|اكستريت|اكسترييت|'
+    r'او\s*دو|او\s*دي|أو\s*دو|أو\s*دي|'
+    r'الرجالي|النسائي|للجنسين|رجالي|نسائي|'
+    r'parfum|perfume|cologne|toilette|extrait|intense|'
+    r'eau\s*de|pour\s*homme|pour\s*femme|for\s*men|for\s*women|unisex|'
+    r'edp|edt|edc)\b'
+    r'|\b\d+(?:\.\d+)?\s*(?:ml|مل|ملي|oz)\b'   # أحجام: 100ml, 50مل
+    r'|\b(100|200|50|75|150|125|250|300|30|80)\b',  # أرقام أحجام منفردة
+    re.UNICODE | re.IGNORECASE
+)
 
 def normalize(text):
     """تطبيع قياسي: يوحّد الحروف والمرادفات مع الحفاظ على كامل النص"""
@@ -399,7 +437,7 @@ def normalize(text):
 def normalize_name(text):
     """
     الدالة الموحدة للمطابقة — تُستخدم حصراً لمقارنة الأسماء.
-    تحذف: عطر/بارفيوم/بيرفيوم/تستر/مل/edp/edt/للجنسين/... (لا تمسح الأرقام الهوائية مثل 212 في الاسم)
+    تحذف: عطر/بارفيوم/بيرفيوم/تستر/مل/edp/edt/للجنسين/100/50/...
     توحّد: أ/إ/آ→ا  ة/ه→ه  ى→ي
     المثال: 'عطر ايسينشيال بيرفيوم فيج انفيوجن 100مل' → 'essential فيج infusion'
     """
@@ -414,7 +452,7 @@ def normalize_name(text):
         t = t.replace(k, v)
     # 3. حذف كلمات الضجيج
     t = _NOISE_RE.sub(' ', t)
-    # 4. الرموز فقط — الأرقام تُبقى (هوية المنتج: 212، 360، إلخ)
+    # 4. حذف الرموز (بدون مسح الأرقام)
     t = re.sub(r'[^\w\s\u0600-\u06FF]', ' ', t)
     return re.sub(r'\s+', ' ', t).strip()
 
@@ -432,48 +470,6 @@ def extract_size(text):
     # البحث عن ml
     ml = re.findall(r'(\d+(?:\.\d+)?)\s*(?:ml|مل|ملي|milliliter)', tl)
     return float(ml[0]) if ml else 0.0
-
-
-# ── Capacity & bundle guardrail (reject high fuzzy scores on wrong SKU/volume/bundle)
-
-
-def _first_capacity_ml_from_title(text: str) -> float | None:
-    """First explicit volume in a product title (ml equivalent), or None if absent."""
-    if not isinstance(text, str) or not text.strip():
-        return None
-    m = _CAP_VOL_RE.search(text)
-    if not m:
-        return None
-    try:
-        val = float(m.group(1).replace(",", "."))
-    except (ValueError, TypeError):
-        return None
-    unit = (m.group(2) or "").lower()
-    if unit.startswith("oz") or "ounce" in unit:
-        return round(val * 29.5735, 2)
-    return round(val, 2)
-
-
-def _has_bundle_keyword(text: str) -> bool:
-    if not isinstance(text, str) or not text.strip():
-        return False
-    return bool(_BUNDLE_KW_RE.search(text))
-
-
-def _capacity_bundle_guardrail_ok(our_name: str, comp_name: str) -> bool:
-    """
-    False → force reject (do not treat as same product), regardless of fuzzy score.
-    - Both titles must show an explicit volume; if both exist and differ → reject.
-    - Bundle/set keywords on one side only → reject.
-    """
-    a = _first_capacity_ml_from_title(our_name)
-    b = _first_capacity_ml_from_title(comp_name)
-    if a is not None and b is not None and abs(a - b) > 1.5:
-        return False
-    if _has_bundle_keyword(our_name) != _has_bundle_keyword(comp_name):
-        return False
-    return True
-
 
 def extract_brand(text):
     if not isinstance(text, str): return ""
@@ -497,17 +493,17 @@ def extract_brand(text):
 def extract_type(text):
     if not isinstance(text, str): return ""
     n = normalize(text)
-    # EDT قبل EDP حتى لا يُلتقط «eau de parfum» كـ edt فقط عبر «toilette»
+    if "edp" in n or "extrait" in n: return "EDP"
     if "edt" in n: return "EDT"
     if "edc" in n: return "EDC"
-    if "edp" in n or "extrait" in n or "parfum" in n: return "EDP"
     return ""
 
 def extract_gender(text):
     if not isinstance(text, str): return ""
-    tl = " " + text.lower() + " "
-    m = any(k in tl for k in [" pour homme "," for men "," men "," man "," رجالي "," للرجال "," مان "," هوم "," homme "," uomo "," mans "])
-    w = any(k in tl for k in [" pour femme "," for women "," women "," woman "," نسائي "," للنساء "," النسائي "," lady "," femme "," donna "])
+    tl = text.lower()
+    # تم التحديث ليشمل mans وصيغ الرجال المطلوبة
+    m = any(k in tl for k in ["pour homme","for men"," men "," man ","رجالي","للرجال"," مان "," هوم ","homme"," uomo", "mans", "for mans", " mans "])
+    w = any(k in tl for k in ["pour femme","for women","women"," woman ","نسائي","للنساء","النسائي","lady","femme"," donna"])
     if m and not w: return "رجالي"
     if w and not m: return "نسائي"
     return ""
@@ -585,7 +581,7 @@ def extract_product_line(text, brand=""):
             n = re.sub(r'\b' + re.escape(w) + r'\b', ' ', n, flags=re.IGNORECASE)
         else:
             n = re.sub(r'(?:^|\s)' + re.escape(w) + r'(?:\s|$)', ' ', n)
-    # إزالة الحجم فقط عند وجود وحدة قياس صريحة (لا تُمس الأرقام العارية)
+    # إزالة الأرقام (الحجم) + مل/ml الملتصقة
     n = re.sub(r'\d+(?:\.\d+)?\s*(ml|مل|ملي|oz|لتر)\b', ' ', n)
     # إزالة الرموز
     n = re.sub(r'[^\w\s\u0600-\u06FF]', ' ', n)
@@ -625,17 +621,18 @@ def classify_product(name):
     return 'retail'
 
 def _price(row):
-    for c in ["السعر","Price","price","سعر","PRICE","سعر المنتج","سعر_المنتج"]:
+    for c in ["السعر","Price","price","سعر","PRICE"]:
         if c in row.index:
             try: return float(str(row[c]).replace(",",""))
-            except Exception:
-                logger.warning(
-                    "_price: parse failed column=%r raw=%r",
-                    c,
-                    row.get(c),
-                    exc_info=True,
-                )
-    # لا fallback عشوائي — قد يلتقط SKU أو رقم المنتج كسعر
+            except: pass
+    # احتياطي: ابحث عن أي عمود رقمي يشبه السعر
+    for c in row.index:
+        try:
+            v = float(str(row[c]).replace(",",""))
+            if 1 <= v <= 99999:  # نطاق سعر معقول
+                return v
+        except:
+            pass
     return 0.0
 
 def _pid(row, col):
@@ -648,12 +645,7 @@ def _pid(row, col):
         if fv == int(fv):
             return str(int(fv))
     except (ValueError, TypeError):
-        logger.warning(
-            "_pid: float/int normalize failed col=%r v=%r",
-            col,
-            v,
-            exc_info=True,
-        )
+        pass
     return str(v).strip()
 
 def _fcol(df, cands):
@@ -676,7 +668,7 @@ def _fcol(df, cands):
         for col in cols:
             if c in col or _norm_ar(c) in _norm_ar(col):
                 return col
-    return ""
+    return cols[0] if cols else ""
 
 # ═══════════════════════════════════════════════════════
 #  الكلاس الجديد: Pre-normalized Competitor Index
@@ -702,7 +694,7 @@ class CompIndex:
         self.plines     = [extract_product_line(n, self.brands[i]) for i, n in enumerate(self.raw_names)]
         self.prices     = [_price(row) for _, row in df.iterrows()]
         self.ids        = [_pid(row, id_col) for _, row in df.iterrows()]
-        _img_cands = ["رابط_الصورة", "image_url", "صورة", "image"]
+        _img_cands = ["رابط_الصورة", "صورة_المنافس", "image_url", "صورة", "image"]
         img_col = next((c for c in _img_cands if c in df.columns), None)
         if img_col is None:
             for c in df.columns:
@@ -716,7 +708,7 @@ class CompIndex:
             else [""] * len(self.df)
         )
 
-    def search(self, our_norm, our_br, our_sz, our_tp, our_gd, our_pline="", top_n=6, our_raw=""):
+    def search(self, our_norm, our_br, our_sz, our_tp, our_gd, our_pline="", top_n=6):
         """بحث vectorized بـ rapidfuzz process.extract مع مقارنة خط الإنتاج"""
         if not self.norm_names: return []
 
@@ -737,8 +729,7 @@ class CompIndex:
             limit=min(30, len(valid_aggs))
         )
 
-        _our_for_class = our_raw if our_raw else our_norm
-        our_class = classify_product(_our_for_class)
+        our_class = classify_product(our_norm)
 
         cands = []
         seen  = set()
@@ -764,10 +755,7 @@ class CompIndex:
                 continue
             if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 2.5:
                 continue
-            # عزل تركيز العطر: EDP/EDT/EDC يجب أن يتطابق عندما يُستنتج من الاسم
-            _conc_our = our_tp or (extract_type(our_raw) if our_raw else "")
-            _conc_comp = c_tp or extract_type(name)
-            if _conc_our and _conc_comp and _conc_our != _conc_comp:
+            if our_tp and c_tp and our_tp != c_tp:
                 continue
             if our_gd and c_gd and our_gd != c_gd:
                 continue
@@ -781,11 +769,6 @@ class CompIndex:
                 if our_class in ('hair_mist','body_mist','set','other') or \
                    c_class in ('hair_mist','body_mist','set','other'):
                     continue
-
-            # ═══ سعة العبوة + طقم/مجموعة (قبل النقاط العالية للـ fuzzy) ═══
-            _our_nm = our_raw if our_raw else our_norm
-            if not _capacity_bundle_guardrail_ok(_our_nm, name):
-                continue
 
             # ═══ مقارنة الأرقام في أسماء المنتجات (نمبر 11 ≠ نمبر 10) ═══
             _NUM_WORDS = {
@@ -834,8 +817,8 @@ class CompIndex:
             if our_pline or c_pl:
                 # إذا كان أحدهما يملك اسماً مميزاً والآخر لا يملك، ارفض التطابق فوراً
                 if (our_pline and not c_pl) or (not our_pline and c_pl):
-                    continue
-
+                    continue 
+                
                 # إذا كان كلاهما يملك خط إنتاج، نقارن بصرامة
                 pl_score = fuzz.token_sort_ratio(our_pline, c_pl)
                 if our_br and c_br:
@@ -885,7 +868,7 @@ class CompIndex:
             base += pline_penalty
 
             score = round(max(0, min(100, base)), 1)
-            if score < MATCH_MIN_SCORE: continue   # ← حد أدنى لمطابقة ذات معنى
+            if score < 60: continue   # ← 60% الحد الأدنى للمراجعة
 
             seen.add(name)
             cands.append({
@@ -907,10 +890,9 @@ _GURL    = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-f
 _OR_URL  = "https://openrouter.ai/api/v1/chat/completions"
 _OR_FREE = [
     "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
     "deepseek/deepseek-chat-v3-0324:free",
     "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "google/gemma-3-27b-it:free",
 ]
 
 def _ai_batch(batch):
@@ -950,27 +932,18 @@ def _ai_batch(batch):
     def _parse(txt):
         """يحلل استجابة AI إلى قائمة أرقام"""
         try:
-            clean = _clean_ai_json(txt)
-            data = json.loads(clean)
-            if isinstance(data, dict):
-                raw = data.get("results", [])
-            elif isinstance(data, list):
-                raw = data
-            else:
-                raw = []
+            clean = re.sub(r'```json|```', '', txt).strip()
+            s = clean.find('{'); e = clean.rfind('}') + 1
+            if s < 0 or e <= s:
+                return None
+            raw = json.loads(clean[s:e]).get("results", [])
             out = []
             for j, it in enumerate(batch):
-                n = raw[j] if j < len(raw) else 0
+                n = raw[j] if j < len(raw) else 1
                 try:
                     n = int(float(str(n)))
                 except Exception:
-                    logger.warning(
-                        "_parse: candidate index parse failed j=%s raw_n=%r",
-                        j,
-                        raw[j] if j < len(raw) else None,
-                        exc_info=True,
-                    )
-                    n = 0
+                    n = 1
                 if 1 <= n <= len(it["candidates"]):
                     out.append(n - 1)
                 elif n == 0:
@@ -979,11 +952,6 @@ def _ai_batch(batch):
                     out.append(0)
             return out if len(out) == len(batch) else None
         except Exception:
-            logger.error(
-                "_parse: AI JSON response parse failed batch_size=%s",
-                len(batch),
-                exc_info=True,
-            )
             return None
 
     # ── 1. Gemini ─────────────────────────────────────────────────────────
@@ -1014,21 +982,13 @@ def _ai_batch(batch):
                             _cset(ck, out)
                             return out
                 except Exception:
-                    logger.error(
-                        "Gemini retry POST after 429 failed (same key)",
-                        exc_info=True,
-                    )
+                    pass
             # 403/400 → جرب المفتاح التالي فوراً
         except Exception:
-            logger.error(
-                "Gemini primary POST failed key_configured=%s",
-                bool(key),
-                exc_info=True,
-            )
             continue
 
     # ── 2. OpenRouter fallback ────────────────────────────────────────────
-    or_key = get_openrouter_api_key()
+    or_key = OPENROUTER_API_KEY
     if or_key:
         for model in _OR_FREE:
             try:
@@ -1052,11 +1012,6 @@ def _ai_batch(batch):
                 elif r.status_code in (401, 402):
                     break
             except Exception:
-                logger.error(
-                    "OpenRouter request failed model=%r",
-                    model,
-                    exc_info=True,
-                )
                 continue
 
     # ── 3. Fuzzy fallback — لا يتوقف أبداً ──────────────────────────────
@@ -1107,17 +1062,17 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
     # الحدود المستخدمة:
     #   score ≥ 85%           → مطابقة مؤكدة → توزيع سعري
     #   60% ≤ score < 85%     → تحت المراجعة (مطابقة محتملة)
-    #   score < MATCH_MIN_SCORE → يُخفى تماماً (return None من run_full_analysis)
+    #   score < 60%           → يُخفى تماماً (return None من run_full_analysis)
     PRICE_DIFF_THRESHOLD = 10  # فرق السعر المقبول بالريال
-    NO_MATCH_THRESHOLD   = MATCH_MIN_SCORE  # أقل من هذا → غير متطابق → يُخفى
+    NO_MATCH_THRESHOLD   = 60  # أقل من هذا → غير متطابق → يُخفى
     REVIEW_MAX           = 85  # أقل من هذا → مراجعة
     if override:
         dec = override
     elif score < NO_MATCH_THRESHOLD:
         # نسبة منخفضة جداً → لا يظهر في أي واجهة
         return None  # ← الفلتر الحاسم: يُحذف من النتائج كلياً
-    elif src in ("gemini", "auto", "vision", "auto_no_api") or score >= REVIEW_MAX:
-        # مطابقة مؤكدة (≥85%) أو تأكيد بصري / بدون API قوي → توزيع حسب السعر
+    elif src in ("gemini", "auto", "vision") or score >= REVIEW_MAX:
+        # مطابقة مؤكدة (≥85%) أو تأكيد بصري → توزيع حسب السعر
         if our_price > 0 and cp > 0:
             if diff > PRICE_DIFF_THRESHOLD:     dec = "🔴 سعر أعلى"
             elif diff < -PRICE_DIFF_THRESHOLD:   dec = "🟢 سعر أقل"
@@ -1130,8 +1085,6 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
 
     ai_lbl = {"gemini": f"🤖✅({score:.0f}%)",
               "auto": f"🎯({score:.0f}%)",
-              "auto_no_api": f"🎯📴({score:.0f}%)",
-              "review_no_api": f"⚠️📴({score:.0f}%)",
               "vision": f"👁️✅({score:.0f}%)",
               "vision_reject": f"👁️❌({score:.0f}%)",
               "gemini_no_match": "🤖❌"}.get(src, f"{score:.0f}%")
@@ -1154,9 +1107,9 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
 def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     """
     1. بناء CompIndex لكل منافس (تطبيع مسبق)
-    2. لكل منتجنا → search vectorized (مع ذاكرة تخزين مؤقتة لقائمة المرشحين)
-    3. score≥97 → تلقائي | عند غياب مفاتيح Gemini أو use_ai=False → وضع بدون API (عتبات 75/88)
-    4. مع مفاتيح: ≥AUTO_DECISION_CONFIDENCE (92) → تلقائي | MATCH_MIN_SCORE–91 → رؤية/Gemini
+    2. لكل منتجنا → search vectorized
+    3. score≥97 → تلقائي | ≥AUTO_DECISION_CONFIDENCE (92) → تلقائي بدون API
+       | 60–91 مع صورتان → محكمة Gemini Vision | وإلا → دفعة Gemini نصية
     """
     results = []
     our_col       = _fcol(our_df, ["المنتج","اسم المنتج","Product","Name","name"])
@@ -1190,58 +1143,47 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     BATCH   = 8  # خفض من 12 إلى 8 لتقليل ضغط Gemini ومنع rate limit
 
     def _flush():
-        """يُعالج الـ pending batch — عند رفض AI أو ci=-1 يُطبَّق وضع بدون API (_no_api_resolve_row)."""
+        """يُعالج الـ pending batch ويضيف النتائج مباشرة — محمي من الأخطاء"""
         if not pending:
             return
         try:
             idxs = _ai_batch(pending)
         except Exception:
-            logger.error(
-                "_flush: _ai_batch failed pending_items=%s",
-                len(pending),
-                exc_info=True,
-            )
-            idxs = [-1] * len(pending)
+            # فشل AI → fallback: استخدم أفضل مرشح fuzzy
+            idxs = []
+            for it in pending:
+                cands = it.get("candidates", [])
+                if cands and cands[0].get("score", 0) >= 88:
+                    idxs.append(0)
+                else:
+                    idxs.append(-1)
         for j, it in enumerate(pending):
             try:
-                ci = idxs[j] if j < len(idxs) else -1
-                cands = it.get("candidates") or []
-                best0 = cands[0] if cands else None
-                if ci < 0 and best0:
-                    rr = _no_api_resolve_row(
-                        it["product"], it["our_price"], it["our_id"],
-                        it["brand"], it["size"], it["ptype"], it["gender"],
-                        it.get("our_pline", ""), best0, it.get("all_cands", []),
-                        it.get("our_img", ""),
-                    )
-                    if rr is not None:
-                        results.append(rr)
-                    continue
+                ci = idxs[j] if j < len(idxs) else 0
                 if ci < 0:
-                    continue
-                best = it["candidates"][ci]
-                rr = _row(it["product"], it["our_price"], it["our_id"],
-                          it["brand"], it["size"], it["ptype"], it["gender"],
-                          best, src="gemini", all_cands=it["all_cands"],
-                          our_img=it.get("our_img", ""))
+                    # AI غير متأكد → أعطِ أفضل مرشح كمراجعة
+                    best_fallback = it["candidates"][0] if it["candidates"] else None
+                    rr = _row(it["product"], it["our_price"], it["our_id"],
+                              it["brand"], it["size"], it["ptype"], it["gender"],
+                              best_fallback, "⚠️ تحت المراجعة", "ai_uncertain",
+                              all_cands=it["all_cands"], our_img=it.get("our_img", ""))
+                else:
+                    best = it["candidates"][ci]
+                    rr = _row(it["product"], it["our_price"], it["our_id"],
+                              it["brand"], it["size"], it["ptype"], it["gender"],
+                              best, src="gemini", all_cands=it["all_cands"],
+                              our_img=it.get("our_img", ""))
                 if rr is not None:
                     results.append(rr)
             except Exception:
-                logger.error(
-                    "_flush: single row build failed product=%r",
-                    it.get("product"),
-                    exc_info=True,
-                )
+                # خطأ في منتج واحد → تخطيه وأكمل
                 continue
         pending.clear()
         # تأخير صغير بين الباتشات لمنع rate limit
         try:
             time.sleep(0.5)
         except Exception:
-            logger.warning(
-                "sleep between AI batches interrupted",
-                exc_info=True,
-            )
+            pass
 
     for i, (_, row) in enumerate(our_df.iterrows()):
         product = str(row.get(our_col, "")).strip()
@@ -1255,12 +1197,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             try:
                 our_price = float(str(row[our_price_col]).replace(",", ""))
             except Exception:
-                logger.error(
-                    "run_full_analysis: our_price parse failed product=%r col=%r",
-                    product,
-                    our_price_col,
-                    exc_info=True,
-                )
+                pass
 
         our_id  = _pid(row, our_id_col)
         our_img = ""
@@ -1270,40 +1207,19 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                 if pd.notna(_vim):
                     our_img = str(_vim).strip()
             except Exception:
-                logger.error(
-                    "run_full_analysis: our_img read failed product=%r col=%r",
-                    product,
-                    our_img_col,
-                    exc_info=True,
-                )
                 our_img = ""
         brand   = extract_brand(product)
         size    = extract_size(product)
         ptype   = extract_type(product)
         gender  = extract_gender(product)
-        if size > 0 and size < 10:
-            # عينات أقل من 10ml: لا تُطابق وتُستبعد من مسار المفقودات
-            if progress_callback:
-                progress_callback((i + 1) / total, results)
-            continue
         our_n   = normalize(product)
         our_pl  = extract_product_line(product, brand)
 
-        # ── جمع المرشحين من كل الفهارس (مع ذاكرة SQLite للجولات المتكررة) ──
-        _sig = "|".join(f"{nm}:{len(obj.df)}" for nm, obj in sorted(indices.items()))
-        _ck = hashlib.md5(f"{product}|{_sig}".encode()).hexdigest()
-        _cached = _cget(f"compmatch:{_ck}")
-        if _cached and isinstance(_cached, list) and _cached:
-            all_cands = list(_cached)
-        else:
-            all_cands = []
-            for idx_obj in indices.values():
-                all_cands.extend(idx_obj.search(our_n, brand, size, ptype, gender,
-                                                our_pline=our_pl, top_n=6, our_raw=product))
-            try:
-                _cset(f"compmatch:{_ck}", all_cands[:40])
-            except Exception:
-                logger.warning("compmatch cache write failed", exc_info=True)
+        # ── جمع المرشحين من كل الفهارس ──
+        all_cands = []
+        for idx_obj in indices.values():
+            all_cands.extend(idx_obj.search(our_n, brand, size, ptype, gender,
+                                            our_pline=our_pl, top_n=6))
 
         if not all_cands:
             # ← الإصلاح الجوهري: لا يوجد أي منافس لهذا المنتج إطلاقاً
@@ -1316,24 +1232,16 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         top5  = all_cands[:5]
         best0 = top5[0]
 
-        if best0["score"] < MATCH_MIN_SCORE:
+        if best0["score"] < 60:
             # score منخفض جداً → لا يوجد منافس حقيقي → تخطي تماماً
             if progress_callback:
                 progress_callback((i + 1) / total, results)
             continue
 
-        if best0["score"] >= 97:
+        if best0["score"] >= 97 or not use_ai:
             row_result = _row(product, our_price, our_id, brand, size, ptype, gender,
                               best0, src="auto", all_cands=all_cands, our_img=our_img)
             if row_result is not None:   # ← فلتر None
-                results.append(row_result)
-        elif (not _gemini_keys_available()) or (not use_ai):
-            # بدون مفاتيح Gemini أو تعطيل AI: عتبات متدرّجة (auto_no_api / review_no_api / تخطي)
-            row_result = _no_api_resolve_row(
-                product, our_price, our_id, brand, size, ptype, gender,
-                our_pl, best0, all_cands, our_img,
-            )
-            if row_result is not None:
                 results.append(row_result)
         elif best0["score"] >= AUTO_DECISION_CONFIDENCE:
             # ≥92%: أتمتة كاملة بدون استدعاء API (معيار AUTO_DECISION_CONFIDENCE)
@@ -1341,8 +1249,8 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                               best0, src="auto", all_cands=all_cands, our_img=our_img)
             if row_result is not None:
                 results.append(row_result)
-        elif best0["score"] >= MATCH_MIN_SCORE:
-            # MATCH_MIN_SCORE–91%: محكمة بصرية إن وُجدت صورتان، وإلا دفعة Gemini النصية
+        elif best0["score"] >= 60:
+            # 60–91%: محكمة بصرية إن وُجدت صورتان، وإلا دفعة Gemini النصية
             cimg = best0.get("image") or ""
             _ou = str(our_img or "").strip()
             _ci = str(cimg or "").strip()
@@ -1384,23 +1292,15 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                         pending.append(dict(
                             product=product, our_price=our_price, our_id=our_id,
                             brand=brand, size=size, ptype=ptype, gender=gender,
-                            our_pline=our_pl,
                             candidates=top5, all_cands=all_cands,
                             our=product, price=our_price, our_img=our_img,
                         ))
                         if len(pending) >= BATCH:
                             _flush()
                 except Exception:
-                    logger.error(
-                        "run_full_analysis: vision_match_court branch failed product=%r best=%r",
-                        product,
-                        best0.get("name"),
-                        exc_info=True,
-                    )
                     pending.append(dict(
                         product=product, our_price=our_price, our_id=our_id,
                         brand=brand, size=size, ptype=ptype, gender=gender,
-                        our_pline=our_pl,
                         candidates=top5, all_cands=all_cands,
                         our=product, price=our_price, our_img=our_img,
                     ))
@@ -1410,7 +1310,6 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                 pending.append(dict(
                     product=product, our_price=our_price, our_id=our_id,
                     brand=brand, size=size, ptype=ptype, gender=gender,
-                    our_pline=our_pl,
                     candidates=top5, all_cands=all_cands,
                     our=product, price=our_price, our_img=our_img,
                 ))
@@ -1495,8 +1394,8 @@ def find_missing_products(our_df, comp_dfs):
             if len(w) >= 3 and w in _word_idx:
                 for p in _word_idx[w]:
                     seen[id(p)] = p
-        # لا fallback لكل المنتجات — يسبب O(N²) كارثي مع آلاف المنتجات
-        return list(seen.values())
+        # fallback: إذا لم يجد شيئاً → ابحث في كامل القائمة
+        return list(seen.values()) if seen else our_items
 
     def _is_same_product(cp_raw, cn, c_brand, c_pline, c_size, c_type, c_gender, c_is_tester, c_agg=""):
         """
@@ -1521,8 +1420,6 @@ def find_missing_products(our_df, comp_dfs):
         best_variant= (0, None, "")   # تستر ↔ أساسي
 
         for p in candidates[:400]:
-            if not _capacity_bundle_guardrail_ok(cp_raw, p["raw"]):
-                continue
             # ← المقارنة على bare (agg بدون تستر) بدل norm
             o_bare = p["bare"]
             base, set_sc, pline_sc = _score_pair(bare_cn, o_bare, c_pline, p["pline"])
@@ -1598,23 +1495,10 @@ def find_missing_products(our_df, comp_dfs):
             "SKU","sku","Sku","رمز المنتج","رمز_المنتج",
             "الكود","كود","Code","code","الرقم","رقم","Barcode","barcode","الباركود"
         ])
-        img_col = _fcol(cdf, [
-            "رابط_الصورة", "صورة_المنافس", "image_url", "صورة", "image", "Image",
-            "رابط الصورة", "صورة المنتج",
-        ])
 
         for _, row in cdf.iterrows():
             cp = str(row.get(ccol, "")).strip()
-            if not cp or is_sample(cp):
-                continue
-            _c_sz = extract_size(cp)
-            if _c_sz > 0 and _c_sz < 10:
-                continue
-            _c_cls = classify_product(cp)
-            if _c_cls in ("hair_mist", "body_mist", "set"):
-                continue
-            if is_set(cp):
-                continue
+            if not cp or is_sample(cp): continue
 
             cn    = normalize(cp)
             c_agg = normalize_name(cp)        # ← normalize_name
@@ -1625,18 +1509,6 @@ def find_missing_products(our_df, comp_dfs):
             if not bare_ck or len(bare_ck) < 3: continue
             if bare_ck in seen_bare: continue
 
-            # ── الحاجز 1: token_set ≥ 88% مع كتالوجنا — قبل أي حساب ثقيل
-            _tok88 = False
-            for p in our_items:
-                if (
-                    fuzz.token_set_ratio(bare_ck, p["bare"]) >= 88
-                    and _capacity_bundle_guardrail_ok(cp, p["raw"])
-                ):
-                    _tok88 = True
-                    break
-            if _tok88:
-                continue
-
             c_brand   = extract_brand(cp)
             c_pline   = extract_product_line(cp, c_brand)
             c_size    = extract_size(cp)
@@ -1644,11 +1516,24 @@ def find_missing_products(our_df, comp_dfs):
             c_gender  = extract_gender(cp)
             c_is_t    = is_tester(cp)
 
+            # ── Cross-check الأول: بالـ normalize_aggressive ─────────
             found, score, reason, variant = _is_same_product(
                 cp, cn, c_brand, c_pline, c_size, c_type, c_gender, c_is_t, c_agg)
 
             if found:
                 continue  # موجود لدينا → تخطي
+
+            # ── Cross-check الثاني: token_set_ratio المباشر على bare ─
+            # يحمي من الحالات الهامشية التي يفوتها _is_same_product
+            if not found:
+                for p in our_items:
+                    direct = fuzz.token_set_ratio(bare_ck, p["bare"])
+                    if direct >= 82:   # 82% بعد الـ normalize_aggressive = تطابق فعلي
+                        found = True
+                        break
+
+            if found:
+                continue
 
             seen_bare.add(bare_ck)
 
@@ -1667,25 +1552,9 @@ def find_missing_products(our_df, comp_dfs):
             else:
                 _conf_level = "green"
 
-            c_img = ""
-            if img_col:
-                try:
-                    c_img = str(row.get(img_col, "") or "").strip()
-                except Exception:
-                    c_img = ""
-
-            _brand_known = bool(
-                c_brand.strip() and bool(_fuzzy_correct_brand(c_brand, threshold=80))
-            )
-            _path_note = ""
-            if not _brand_known:
-                _conf_level = "yellow"
-                _path_note = "ماركة غير مؤكدة في القائمة المرجعية — يُفضّل المراجعة"
-
             entry = {
                 "منتج_المنافس":  cp,
                 "معرف_المنافس":  _pid(row, icol),
-                "صورة_المنافس":  c_img,
                 "سعر_المنافس":   _price(row),
                 "المنافس":       cname,
                 "الماركة":       c_brand,
@@ -1694,11 +1563,9 @@ def find_missing_products(our_df, comp_dfs):
                 "الجنس":         c_gender,
                 "هو_تستر":       c_is_t,
                 "تاريخ_الرصد":   datetime.now().strftime("%Y-%m-%d"),
-                "ملاحظة":        (reason if reason and "⚠️" in reason else "")
-                + ((" | " + _path_note) if _path_note else ""),
+                "ملاحظة":        reason if reason and "⚠️" in reason else "",
                 "درجة_التشابه":  round(score, 1),
                 "مستوى_الثقة":  _conf_level,
-                "مسار_المفقودات": "تحت المراجعة" if not _brand_known else "مفقود",
             }
 
             # إضافة معلومات النوع المتاح (تستر/أساسي)
@@ -1713,17 +1580,7 @@ def find_missing_products(our_df, comp_dfs):
 
             missing.append(entry)
 
-    out = pd.DataFrame(missing) if missing else pd.DataFrame()
-    if not out.empty:
-        try:
-            from engines.reference_data import enrich_missing_reference_columns
-            out = enrich_missing_reference_columns(out)
-        except Exception:
-            logger.warning(
-                "enrich_missing_reference_columns failed (reference_data)",
-                exc_info=True,
-            )
-    return out
+    return pd.DataFrame(missing) if missing else pd.DataFrame()
 
 def export_excel(df, sheet_name="النتائج"):
     from openpyxl.styles import PatternFill, Font, Alignment
@@ -1763,30 +1620,16 @@ def export_section_excel(df, sname):
 
 
 def smart_missing_barrier(
-    missing_df: pd.DataFrame,
-    our_df: pd.DataFrame,
-    threshold: Optional[int] = None,
+    missing_df: pd.DataFrame, our_df: pd.DataFrame, threshold: int = 88
 ) -> pd.DataFrame:
     """
     محرك الحاجز الذكي: الفلتر النهائي قبل دخول المنتجات لقسم المفقودات.
-    يقلل التكرار عبر مطابقة الـ SKU والـ Fuzzy (token_set_ratio) — افتراضياً من الإعدادات (88٪).
+    يقلل التكرار عبر مطابقة الـ SKU والـ Fuzzy (token_set_ratio).
     """
-    if threshold is None:
-        threshold = SMART_MISSING_FUZZ_THRESHOLD
     if missing_df.empty or our_df.empty:
         return missing_df
 
-    _desc = None
-    for c in ("وصف_المنافس", "الوصف", "description", "Description"):
-        if c in missing_df.columns:
-            _desc = c
-            break
-    filtered_df, _ = apply_strict_pipeline_filters(
-        missing_df, name_col="منتج_المنافس", desc_col=_desc
-    )
-    filtered_df = tag_missing_volume_status(
-        filtered_df, name_col="منتج_المنافس", desc_col=_desc
-    )
+    filtered_df, _ = apply_strict_pipeline_filters(missing_df, name_col="منتج_المنافس")
 
     if filtered_df.empty:
         return filtered_df
@@ -1846,11 +1689,7 @@ def smart_missing_barrier(
                 if fv == int(fv):
                     our_skus.add(str(int(fv)))
             except Exception:
-                logger.warning(
-                    "find_missing_products: SKU float normalize failed v=%r",
-                    s,
-                    exc_info=True,
-                )
+                pass
 
     keep_rows: list = []
     for idx, row in filtered_df.iterrows():
@@ -1864,22 +1703,13 @@ def smart_missing_barrier(
             if fv == int(fv) and str(int(fv)) in our_skus:
                 continue
         except Exception:
-            logger.warning(
-                "find_missing_products: comp_sku float check failed comp_sku=%r comp_name=%r",
-                comp_sku,
-                comp_name[:80] if comp_name else "",
-                exc_info=True,
-            )
+            pass
 
         if our_names and comp_name:
             match = rf_process.extractOne(
                 comp_name, our_names, scorer=fuzz.token_set_ratio
             )
-            if (
-                match
-                and match[1] >= threshold
-                and _capacity_bundle_guardrail_ok(match[0], comp_name)
-            ):
+            if match and match[1] >= threshold:
                 continue
 
         keep_rows.append(idx)
