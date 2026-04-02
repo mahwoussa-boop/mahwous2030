@@ -6,6 +6,9 @@ import json as _json
 import os as _os
 import tempfile
 
+# جذر المشروع (مجلد config.py) — لا يعتمد على cwd عند streamlit run من مسار آخر
+_APP_ROOT = _os.path.dirname(_os.path.abspath(__file__))
+
 # ===== معلومات التطبيق =====
 APP_TITLE   = "نظام التسعير الذكي - مهووس"
 APP_NAME    = APP_TITLE
@@ -308,4 +311,4 @@ PAGES_PER_TABLE  = 25
 DB_PATH = _os.path.join(tempfile.gettempdir(), "pricing_v18.db")
 
 # قائمة المنافسين الافتراضية للكشط — يُحمَّل من الملف؛ يمكن تعديل JSON دون المساس بالكود
-PRESET_COMPETITORS_PATH = _os.path.join("data", "preset_competitors.json")
+PRESET_COMPETITORS_PATH = _os.path.join(_APP_ROOT, "data", "preset_competitors.json")

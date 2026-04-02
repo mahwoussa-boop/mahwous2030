@@ -28,11 +28,16 @@ _CF_MSG = (
 
 def _normalize_origin(url: str) -> tuple[str, str]:
     u = (url or "").strip()
+    u = u.replace("\r", "").replace("\n", "").strip()
     if not u:
         return "", ""
     if not re.match(r"^https?://", u, re.I):
-        u = "https://" + u
-    p = urlparse(u)
+        u = "https://" + u.lstrip("/")
+    # urlparse قد يرفع ValueError: Invalid IPv6 URL لروابط فيها [ ] بشكل يُفسَّر كـ IPv6
+    try:
+        p = urlparse(u)
+    except ValueError:
+        return "", ""
     if not p.netloc:
         return "", ""
     origin = f"{p.scheme}://{p.netloc}"

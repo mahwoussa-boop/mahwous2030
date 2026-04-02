@@ -260,6 +260,27 @@ def _on_realtime_scrape_callback(ev: dict):
 # تسجيل الخُطّاف ليقوم السكربر بتغذية الطابور فوراً
 _scrape_event.register_realtime_hook(_on_realtime_scrape_callback)
 
+
+def _our_catalog_has_id_column(df) -> bool:
+    """عمود معرّف المنتج: `no` (سلة) أو `رقم المنتج` وما شابه."""
+    if df is None or getattr(df, "empty", True):
+        return False
+    cols = set(df.columns)
+    return bool(
+        cols
+        & {
+            "no",
+            "رقم المنتج",
+            "معرف المنتج",
+            "معرف",
+            "product_id",
+            "SKU",
+            "sku",
+            "رقم_المنتج",
+        }
+    )
+
+
 def _process_realtime_queue_main_thread():
     """يُفرغ الطابور ويُحلل المنتجات واحداً بواحد في خيط الواجهة (تحديث حي)."""
     if _REALTIME_EV_QUEUE.empty():
@@ -1840,6 +1861,12 @@ def _run_scrape_chain_background():
                 ),
                 "on_scrape_rows_tick": _make_scrape_rows_tick_fn(),
                 "on_pipeline_before_analysis": _make_on_pipeline_before_analysis(),
+                "on_pipeline_error": lambda err: _merge_scrape_live_snapshot(
+                    analysis={
+                        "phase": f"❌ فشل المطابقة: {str(err)[:200]}",
+                        "ai_mode": "GEMINI_API_KEY / الكتالوج / سجلات الطرفية",
+                    }
+                ),
             }
         else:
             pl_dict = {
@@ -1848,7 +1875,15 @@ def _run_scrape_chain_background():
                 "on_scrape_rows_tick": _make_scrape_rows_tick_fn(),
             }
 
-        def scrape_cb(current, total, last_name, _si=store_idx, _ts=total_stores, _t0=chain_t0):
+        def scrape_cb(
+            current,
+            total,
+            last_name,
+            n_product_rows=0,
+            _si=store_idx,
+            _ts=total_stores,
+            _t0=chain_t0,
+        ):
             now = time.time()
             elapsed = max(0.001, now - _t0)
             elapsed_i = int(elapsed)
@@ -1883,6 +1918,12 @@ def _run_scrape_chain_background():
                 )
             if need_live:
                 _last_live[0] = now
+                _nr = int(n_product_rows or 0)
+                _aph = (
+                    f"🕸️ {_nr} صف منتج صالح — جاري الفرز كل {pl_every} صفوف"
+                    if _nr
+                    else "🕸️ جاري جلب الصفحات — لا صفوف منتج صالح بعد (سعر/تكرار/استخراج)"
+                )
                 _merge_scrape_live_snapshot(
                     scrape={
                         "current": current,
@@ -1891,7 +1932,16 @@ def _run_scrape_chain_background():
                         "elapsed_sec": elapsed_i,
                         "urls_per_min": round(urls_pm, 1),
                         "products_per_min": round(ppm, 1),
-                    }
+                    },
+                    analysis={
+                        "scraped_rows": _nr,
+                        "phase": _aph,
+                        "progress_pct": min(
+                            1.0, float(_nr) / max(float(total), 1.0)
+                        )
+                        if _nr
+                        else 0.0,
+                    },
                 )
 
         try:
@@ -3079,8 +3129,10 @@ elif page == "📂 رفع الملفات":
             with open(our_path, "wb") as f:
                 f.write(uploaded_catalog_main.read())
             _tmp_df = pd.read_csv(our_path)
-            if "no" not in _tmp_df.columns:
-                st.error("❌ الملف رُفع لكن عمود المعرف الإلزامي `no` غير موجود.")
+            if not _our_catalog_has_id_column(_tmp_df):
+                st.error(
+                    "❌ الملف رُفع لكن لا يوجد عمود معرّف منتج (`no` أو `رقم المنتج` أو `SKU` …)."
+                )
             else:
                 st.success(f"✅ تم حفظ الكتالوج بنجاح — عدد الصفوف: {len(_tmp_df):,}")
         except Exception as e:
@@ -3099,8 +3151,8 @@ elif page == "📂 رفع الملفات":
     with st.expander("📌 **المنافسون المحفوظون** (ملف `data/preset_competitors.json`)", expanded=True):
         if not _presets_ui:
             st.warning(
-                "تعذر تحميل القائمة. أنشئ أو راجع الملف: **`data/preset_competitors.json`** "
-                "(مصفوفة JSON: `name`, `store_url`, `sitemap_url` لكل متجر)."
+                f"تعذر تحميل القائمة من `{PRESET_COMPETITORS_PATH}`. أنشئ الملف أو أصلح JSON "
+                "(مصفوفة: `name`, `store_url`, `sitemap_url` لكل متجر — يجب أن يبدأ أحد الرابطين بـ http)."
             )
         else:
             _plabels = [p["name"] for p in _presets_ui]

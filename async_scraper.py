@@ -343,7 +343,7 @@ async def _expand_sitemap_to_page_urls_async(
             if len(seen_sm) <= 1 or (now_sm - _sm_prog_last[0]) >= 0.55:
                 _sm_prog_last[0] = now_sm
                 try:
-                    progress_cb(len(seen_sm), len(q), len(page_urls))
+                    progress_cb(len(seen_sm), len(q), len(page_urls), 0)
                 except Exception:
                     logger.exception(
                         "sitemap progress_cb failed sm_url=%s seen_sm=%s",
@@ -840,6 +840,7 @@ def _pipeline_analysis_worker(
     use_ai_partial: bool,
     on_analysis_snapshot: Any = None,
     on_pipeline_before_analysis: Any = None,
+    on_pipeline_error: Any = None,
 ) -> None:
     """يستهلك لقطات صفوف المنافس ويشغّل run_full_analysis — الوسطى بدون AI افتراضياً."""
     import pandas as pd
@@ -919,6 +920,11 @@ def _pipeline_analysis_worker(
             )
             out["error"] = str(e)
             out["is_final"] = False
+            if on_pipeline_error:
+                try:
+                    on_pipeline_error(str(e))
+                except Exception:
+                    logger.exception("on_pipeline_error callback failed")
 
 
 def _pipeline_maybe_enqueue(
@@ -1008,6 +1014,7 @@ async def _run_scraper_async(
                         si + 1,
                         max(1, len(seeds)),
                         f"🔍 فهرسة sitemap للمتجر {si + 1}/{len(seeds)}...",
+                        0,
                     )
                 except Exception:
                     logger.exception(
@@ -1018,11 +1025,12 @@ async def _run_scraper_async(
             expanded = await _expand_sitemap_to_page_urls_async(
                 fetcher,
                 seed,
-                progress_cb=lambda seen_sm, queued, found: (
+                progress_cb=lambda seen_sm, queued, found, _nprod=0: (
                     progress_cb(
                         si + 1,
                         max(1, len(seeds)),
                         f"🔍 sitemap {si + 1}/{len(seeds)} | خرائط:{seen_sm} | queued:{queued} | روابط:{found}",
+                        0,
                     )
                     if progress_cb
                     else None
@@ -1075,9 +1083,19 @@ async def _run_scraper_async(
             our_df_pl = pipeline["our_df"]
             on_snap = pipeline.get("on_analysis_snapshot")
             on_before = pipeline.get("on_pipeline_before_analysis")
+            on_err = pipeline.get("on_pipeline_error")
             pipeline_thread = threading.Thread(
                 target=_pipeline_analysis_worker,
-                args=(pipeline_q, out, our_df_pl, comp_key, use_ai_partial, on_snap, on_before),
+                args=(
+                    pipeline_q,
+                    out,
+                    our_df_pl,
+                    comp_key,
+                    use_ai_partial,
+                    on_snap,
+                    on_before,
+                    on_err,
+                ),
                 daemon=True,
             )
             pipeline_thread.start()
@@ -1148,6 +1166,7 @@ async def _run_scraper_async(
                     i_pos + 1,
                     total_n,
                     name_hint[:80] if name_hint else "جاري البحث...",
+                    len(rows),
                 )
             except Exception:
                 logger.exception("progress_cb failed i_pos=%s total=%s", i_pos, total_n)

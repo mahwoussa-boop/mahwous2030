@@ -131,7 +131,7 @@ https://share.streamlit.io
 ```toml
 # Settings → Secrets
 
-GEMINI_API_KEYS = '["KEY1","KEY2"]'
+GEMINI_API_KEYS = '["AIzaSyD4PLzzy8GTmqtLtEhTecUKHZ7pPPhtv3s","AIzaSyCzMKz1dcEExSTUoOx-dXFAVaxlgvy1SYo","AIzaSyDQwXq-SqqGiyZzjrQIpDRDjOBr7CfCifY","AIzaSyCM_7dJ-0mq4H81CHBYAIA1MkDbj8lk7Ko"]'
 
 WEBHOOK_UPDATE_PRICES = "https://hook.eu2.make.com/99oljy0d6r3chwg6bdfsptcf6bk8htsd"
 
