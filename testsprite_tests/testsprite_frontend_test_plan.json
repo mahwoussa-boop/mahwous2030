@@ -1,0 +1,472 @@
+[
+  {
+    "id": "TC001",
+    "title": "Start competitor scraping and observe live progress indicators",
+    "description": "Verifies that a user can start scraping from the main page and observe live progress/row counters updating.",
+    "category": "Competitor Scraping Pipeline",
+    "priority": "High",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Fill competitor sitemap or store URL(s) into the competitor URL input"
+      },
+      {
+        "type": "action",
+        "description": "Click start scraping and analysis"
+      },
+      {
+        "type": "action",
+        "description": "Wait for live scraping progress indicators to update"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify live scraping progress and row counters are displayed"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify scraped products are shown as available for downstream use in the app"
+      }
+    ]
+  },
+  {
+    "id": "TC002",
+    "title": "Resumable scraping run continues after restarting with same URLs",
+    "description": "Verifies that checkpointing allows a scraping run to resume/continue when started again with the same inputs.",
+    "category": "Competitor Scraping Pipeline",
+    "priority": "High",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Fill competitor sitemap or store URL(s) into the competitor URL input"
+      },
+      {
+        "type": "action",
+        "description": "Click start scraping and analysis"
+      },
+      {
+        "type": "action",
+        "description": "Wait for live scraping progress indicators to update"
+      },
+      {
+        "type": "action",
+        "description": "Click start scraping and analysis again with the same competitor URL(s)"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify the scraping run resumes or continues without starting from an empty state"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify live scraping progress and row counters continue updating"
+      }
+    ]
+  },
+  {
+    "id": "TC003",
+    "title": "Invalid competitor URL input is blocked or shows validation feedback",
+    "description": "Verifies that the UI prevents starting scraping with invalid competitor URL input and shows user-facing validation feedback.",
+    "category": "Competitor Scraping Pipeline",
+    "priority": "Medium",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Fill invalid text into the competitor URL input"
+      },
+      {
+        "type": "action",
+        "description": "Click start scraping and analysis"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify an input validation error is visible"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify scraping does not start and no live progress indicators appear"
+      }
+    ]
+  },
+  {
+    "id": "TC004",
+    "title": "Scraping with multiple competitor URLs starts and tracks progress",
+    "description": "Verifies that the user can provide multiple competitor URLs and the UI still starts scraping and tracks progress.",
+    "category": "Competitor Scraping Pipeline",
+    "priority": "Medium",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Fill multiple competitor sitemap or store URL(s) into the competitor URL input"
+      },
+      {
+        "type": "action",
+        "description": "Click start scraping and analysis"
+      },
+      {
+        "type": "action",
+        "description": "Wait for live scraping progress indicators to update"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify live scraping progress and row counters are displayed"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify the app indicates competitor data collection is in progress or available"
+      }
+    ]
+  },
+  {
+    "id": "TC005",
+    "title": "Scraping pipeline primary content loads on the main page",
+    "description": "Verifies that the main page exposes the competitor scraping inputs and start action.",
+    "category": "Competitor Scraping Pipeline",
+    "priority": "High",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify competitor sitemap/store URL input controls are displayed"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify the start scraping and analysis control is available"
+      }
+    ]
+  },
+  {
+    "id": "TC006",
+    "title": "End-to-end price comparison workflow with catalog upload and decision updates",
+    "description": "Verifies that a user can upload a catalog, run analysis, view grouped results, adjust a decision, and export the final decisions.",
+    "category": "Price Comparison and Decision Workflow",
+    "priority": "High",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Upload a valid catalog CSV that includes a unique identifier column named no"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run analysis and review sections"
+      },
+      {
+        "type": "action",
+        "description": "Scroll to the grouped results sections"
+      },
+      {
+        "type": "action",
+        "description": "Select a different decision action for one product from the decision controls"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to export decisions"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify grouped results are displayed for multiple decision categories"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify the exported decisions reflect the updated decision for the edited product"
+      }
+    ]
+  },
+  {
+    "id": "TC007",
+    "title": "Catalog upload validation: missing required no identifier shows error",
+    "description": "Verifies that running analysis with a catalog missing the required no column shows a validation error.",
+    "category": "Price Comparison and Decision Workflow",
+    "priority": "High",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Upload a catalog CSV missing the required identifier column no"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run analysis and review sections"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify a validation error is visible indicating a required identifier column is missing"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify grouped results are not produced for export/webhook-ready decisions"
+      }
+    ]
+  },
+  {
+    "id": "TC008",
+    "title": "Grouped result navigation: inspect each decision group after analysis",
+    "description": "Verifies that after analysis, the user can inspect the main decision groups (higher, lower, approved, missing, review).",
+    "category": "Price Comparison and Decision Workflow",
+    "priority": "Medium",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Upload a valid catalog CSV that includes a unique identifier column named no"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run analysis and review sections"
+      },
+      {
+        "type": "action",
+        "description": "Scroll through the results and open each decision group section"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify decision group sections are displayed including higher, lower, approved, missing, and review"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify product rows are displayed within at least one decision group"
+      }
+    ]
+  },
+  {
+    "id": "TC009",
+    "title": "Modify multiple product decisions and verify persistence in UI summary/export",
+    "description": "Verifies that multiple decision edits are retained and reflected in the final output view/export.",
+    "category": "Price Comparison and Decision Workflow",
+    "priority": "Medium",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Upload a valid catalog CSV that includes a unique identifier column named no"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run analysis and review sections"
+      },
+      {
+        "type": "action",
+        "description": "Select updated decision actions for two different products from the decision controls"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to export decisions"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify the exported decisions reflect both updated decisions for the edited products"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify the app shows a confirmation that export output was produced"
+      }
+    ]
+  },
+  {
+    "id": "TC010",
+    "title": "Price comparison primary content loads on main page",
+    "description": "Verifies that the main page exposes catalog upload, analysis, and decision review controls.",
+    "category": "Price Comparison and Decision Workflow",
+    "priority": "High",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify a catalog CSV upload control is displayed"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify a control to run analysis and review is available"
+      }
+    ]
+  },
+  {
+    "id": "TC011",
+    "title": "AI review flow: run AI verification for review items and accept reclassification",
+    "description": "Verifies that the user can trigger AI review for items in the review group and accept AI suggestions to reclassify.",
+    "category": "AI-Assisted Verification and Deep Analysis",
+    "priority": "High",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Upload a valid catalog CSV that includes a unique identifier column named no"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run analysis and review sections"
+      },
+      {
+        "type": "action",
+        "description": "Scroll to the review items section"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to trigger AI review actions for review items"
+      },
+      {
+        "type": "action",
+        "description": "Wait for AI verification results to appear"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to accept AI suggestions to reclassify selected items"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify AI verification results are displayed with confidence scores"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify accepted items are reclassified and reflected in the decision grouping"
+      }
+    ]
+  },
+  {
+    "id": "TC012",
+    "title": "AI reclassification on selected items only",
+    "description": "Verifies that automatic reclassification can be run for a selected subset of review items and only those items change classification.",
+    "category": "AI-Assisted Verification and Deep Analysis",
+    "priority": "Medium",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Upload a valid catalog CSV that includes a unique identifier column named no"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run analysis and review sections"
+      },
+      {
+        "type": "action",
+        "description": "Scroll to the review items section"
+      },
+      {
+        "type": "action",
+        "description": "Select a subset of review items for AI reclassification"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run automatic reclassification for selected items"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify AI verification results are displayed for the selected items"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify only the selected items change classification in the displayed results"
+      }
+    ]
+  },
+  {
+    "id": "TC013",
+    "title": "AI chat utility opens and returns a response for a product inquiry",
+    "description": "Verifies that the AI chat/interaction utility can be used to ask about a product and a response is displayed.",
+    "category": "AI-Assisted Verification and Deep Analysis",
+    "priority": "Medium",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Upload a valid catalog CSV that includes a unique identifier column named no"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run analysis and review sections"
+      },
+      {
+        "type": "action",
+        "description": "Scroll to the AI chat or AI utilities section"
+      },
+      {
+        "type": "action",
+        "description": "Fill a product-related question into the AI chat input"
+      },
+      {
+        "type": "action",
+        "description": "Submit the AI chat question"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify an AI chat response is displayed"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify the response is associated with the submitted question context"
+      }
+    ]
+  },
+  {
+    "id": "TC014",
+    "title": "AI utilities are discoverable on the main page after analysis",
+    "description": "Verifies that AI verification/deep analysis controls become available in the UI once results exist to review.",
+    "category": "AI-Assisted Verification and Deep Analysis",
+    "priority": "Low",
+    "steps": [
+      {
+        "type": "action",
+        "description": "Navigate to /"
+      },
+      {
+        "type": "action",
+        "description": "Upload a valid catalog CSV that includes a unique identifier column named no"
+      },
+      {
+        "type": "action",
+        "description": "Click the control to run analysis and review sections"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify AI review and deep analysis controls are displayed"
+      },
+      {
+        "type": "assertion",
+        "description": "Verify the review group section is available for AI-assisted actions"
+      }
+    ]
+  }
+]
