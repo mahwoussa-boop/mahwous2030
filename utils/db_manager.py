@@ -28,6 +28,11 @@ def _log_db_err(where: str, err: Exception) -> None:
         pass
 
 
+def _sqlite_like_escape(s: str) -> str:
+    """حماية أنماط LIKE من الرموز الخاصة (%، _، \\) عبر ESCAPE."""
+    return str(s).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -173,9 +178,10 @@ def get_decisions(product_name=None, status=None, limit=100):
     try:
         conn = get_db()
         if product_name:
+            pat = f"%{_sqlite_like_escape(product_name)}%"
             rows = conn.execute(
-                "SELECT * FROM decisions WHERE product_name LIKE ? ORDER BY id DESC LIMIT ?",
-                (f"%{product_name}%", limit)
+                "SELECT * FROM decisions WHERE product_name LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
+                (pat, limit),
             ).fetchall()
         elif status:
             rows = conn.execute(
@@ -789,36 +795,75 @@ def save_processed(product_key: str, product_name: str, competitor: str,
 
 def get_processed(limit=200) -> list:
     """يُعيد قائمة المنتجات المعالجة"""
-    conn = get_db()
-    rows = conn.execute(
-        """SELECT timestamp, product_key, product_name, competitor,
-                  action, old_price, new_price, product_id, notes
-           FROM processed_products ORDER BY timestamp DESC LIMIT ?""",
-        (limit,)
-    ).fetchall()
-    conn.close()
-    keys = ["timestamp","product_key","product_name","competitor",
-            "action","old_price","new_price","product_id","notes"]
-    return [dict(zip(keys, r)) for r in rows]
+    conn = None
+    try:
+        conn = get_db()
+        rows = conn.execute(
+            """SELECT timestamp, product_key, product_name, competitor,
+                      action, old_price, new_price, product_id, notes
+               FROM processed_products ORDER BY timestamp DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        keys = [
+            "timestamp",
+            "product_key",
+            "product_name",
+            "competitor",
+            "action",
+            "old_price",
+            "new_price",
+            "product_id",
+            "notes",
+        ]
+        return [dict(zip(keys, r)) for r in rows]
+    except Exception as e:
+        _log_db_err("get_processed", e)
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def undo_processed(product_key: str) -> bool:
     """تراجع: إزالة المنتج من قائمة المعالجة"""
-    conn = get_db()
-    _begin_immediate(conn)
-    conn.execute("DELETE FROM processed_products WHERE product_key=?", (product_key,))
-    conn.execute("DELETE FROM hidden_products WHERE product_key=?", (product_key,))
-    conn.commit()
-    conn.close()
-    return True
+    conn = None
+    try:
+        conn = get_db()
+        _begin_immediate(conn)
+        conn.execute("DELETE FROM processed_products WHERE product_key=?", (product_key,))
+        conn.execute("DELETE FROM hidden_products WHERE product_key=?", (product_key,))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log_db_err("undo_processed", e)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_processed_keys() -> set:
     """مفاتيح المنتجات المعالجة لاستبعادها من القوائم"""
-    conn = get_db()
-    rows = conn.execute("SELECT product_key FROM processed_products").fetchall()
-    conn.close()
-    return {r[0] for r in rows}
+    conn = None
+    try:
+        conn = get_db()
+        rows = conn.execute("SELECT product_key FROM processed_products").fetchall()
+        return {r[0] for r in rows}
+    except Exception as e:
+        _log_db_err("get_processed_keys", e)
+        return set()
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -990,24 +1035,25 @@ def reset_application_session_storage(
             except Exception:
                 pass
 
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     candidates = [
-        os.path.join("data", "live_session_results.pkl"),
-        os.path.join("data", "live_session_results.pkl.tmp"),
-        os.path.join("data", "scrape_live_snapshot.json"),
-        os.path.join("data", "scrape_bg_context.pkl"),
+        os.path.join(_ROOT, "data", "live_session_results.pkl"),
+        os.path.join(_ROOT, "data", "live_session_results.pkl.tmp"),
+        os.path.join(_ROOT, "data", "scrape_live_snapshot.json"),
+        os.path.join(_ROOT, "data", "scrape_bg_context.pkl"),
     ]
     if clear_scraper_state:
         candidates.extend(
             [
-                os.path.join("data", "scraper_bg_state.json"),
-                os.path.join("data", "scraper_checkpoint.json"),
-                os.path.join("data", "competitors_checkpoint.csv"),
-                os.path.join("data", "scraper_progress.json"),
-                os.path.join("data", "scraper_last_run.json"),
+                os.path.join(_ROOT, "data", "scraper_bg_state.json"),
+                os.path.join(_ROOT, "data", "scraper_checkpoint.json"),
+                os.path.join(_ROOT, "data", "competitors_checkpoint.csv"),
+                os.path.join(_ROOT, "data", "scraper_progress.json"),
+                os.path.join(_ROOT, "data", "scraper_last_run.json"),
             ]
         )
     if clear_match_cache_file:
-        candidates.append("match_cache_v21.db")
+        candidates.append(os.path.join(_ROOT, "match_cache_v21.db"))
 
     for p in candidates:
         try:
@@ -1015,6 +1061,7 @@ def reset_application_session_storage(
                 os.remove(p)
                 removed_files.append(p)
         except Exception as e:
+            _log_db_err(f"reset_storage: failed to remove {p}", e)
             errors.append(f"{p}: {e}")
 
     return {

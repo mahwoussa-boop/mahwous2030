@@ -90,7 +90,9 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
         mask = pd.Series([False] * len(result))
         for col in ["المنتج", "منتج_المنافس", "الماركة"]:
             if col in result.columns:
-                mask = mask | result[col].astype(str).str.contains(search, case=False, na=False)
+                mask = mask | result[col].astype(str).str.contains(
+                    search, case=False, na=False, regex=False
+                )
         result = result[mask]
 
     # فلتر الماركة
@@ -144,7 +146,10 @@ def export_to_excel(df: pd.DataFrame, sheet_name: str = "النتائج") -> byt
         # تنسيق العمود
         ws = writer.sheets[safe_name]
         for col in ws.columns:
-            max_len = max(len(str(cell.value or "")) for cell in col)
+            max_len = max(
+                (len(str(cell.value or "")) for cell in col),
+                default=0,
+            )
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
 
     return output.getvalue()
@@ -168,7 +173,10 @@ def export_multiple_sheets(sheets: Dict[str, pd.DataFrame]) -> bytes:
             # تنسيق تلقائي
             ws = writer.sheets[safe_name]
             for col in ws.columns:
-                max_len = max(len(str(cell.value or "")) for cell in col)
+                max_len = max(
+                    (len(str(cell.value or "")) for cell in col),
+                    default=0,
+                )
                 ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
 
     return output.getvalue()
@@ -806,7 +814,7 @@ def export_missing_products_to_salla_csv(
     *,
     default_category: Optional[str] = None,
     generate_description: Optional[Callable[[Dict[str, Any]], str]] = None,
-) -> str:
+) -> Optional[str]:
     """
     يكتب ملف CSV بصيغة استيراد سلة لمنتجات مفقودة: UTF-8 مع BOM، صفّا رأس مطابقان، ثم البيانات.
 
@@ -816,11 +824,24 @@ def export_missing_products_to_salla_csv(
     - SALLA_IMPORT_DEFAULT_CATEGORY: مسار تصنيف افتراضي يطابق لوحة سلة (مثل: العطور > عطور فرمونية)
     - SALLA_IMPORT_FALLBACK_BRAND: ماركة احتياط عند «غير محدد» (نص كما في brands.csv)
     """
+    abs_out = os.path.abspath(output_filepath)
+    safe_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+    os.makedirs(safe_root, exist_ok=True)
+    try:
+        common = os.path.commonpath([abs_out, safe_root])
+    except ValueError:
+        raise ValueError("output_filepath must be under the safe data directory") from None
+    if common != safe_root:
+        raise ValueError("output_filepath must be under the safe data directory")
+
     rows = _normalize_missing_rows_for_salla(missing_products_list)
+    if not rows:
+        return None
+
     desc_fn = generate_description or default_salla_missing_html_description
     ctx = _salla_export_context()
     dc = (default_category or "").strip() or None
-    _dir = os.path.dirname(os.path.abspath(output_filepath))
+    _dir = os.path.dirname(abs_out)
     if _dir:
         os.makedirs(_dir, exist_ok=True)
 

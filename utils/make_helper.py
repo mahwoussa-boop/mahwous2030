@@ -15,6 +15,9 @@ import json
 import os
 import time
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
+
+MAX_DESC = 50_000
 
 
 # ── Webhook URLs (قراءة من os.environ في كل استدعاء — تُحدَّث من جلسة Streamlit في app.py) ──
@@ -32,6 +35,30 @@ def _webhook_missing_url() -> str:
 TIMEOUT = 15  # ثانية
 
 
+def _webhook_url_allowed(url: str) -> bool:
+    """يمنع SSRF: يقبل فقط https مع netloc صالح (ليس نسبياً وليس بلا مضيف)."""
+    if not url or not isinstance(url, str):
+        return False
+    p = urlparse(url.strip())
+    if (p.scheme or "").lower() != "https":
+        return False
+    host = (p.netloc or "").strip().lower()
+    if not host or host.startswith("."):
+        return False
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return False
+    if not any(c.isalpha() or c.isdigit() for c in host):
+        return False
+    return True
+
+
+def _clip_desc_field(s: str) -> str:
+    t = (s or "").strip()
+    if len(t) <= MAX_DESC:
+        return t
+    return t[: MAX_DESC - 40] + "\n…[وصف مقتوص لتفادي حجم الطلب]"
+
+
 # ── الإرسال الأساسي ────────────────────────────────────────────────────────
 def _post_to_webhook(url: str, payload: Any) -> Dict:
     """
@@ -40,6 +67,12 @@ def _post_to_webhook(url: str, payload: Any) -> Dict:
     """
     if not url:
         return {"success": False, "message": "❌ Webhook URL غير محدد", "status_code": 0}
+    if not _webhook_url_allowed(url):
+        return {
+            "success": False,
+            "message": "❌ رابط Webhook غير مسموح (مطلوب https مع نطاق صالح)",
+            "status_code": 0,
+        }
     try:
         headers = {"Content-Type": "application/json"}
         resp = requests.post(
@@ -317,7 +350,7 @@ def send_new_products(products: List[Dict]) -> Dict:
             "الوزن":           int(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1),
             "سعر التكلفة":     float(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0)))),
             "السعر المخفض":    float(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0)))),
-            "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
+            "الوصف":           _clip_desc_field(str(p.get("الوصف", p.get("description", "")))),
         }
         # حقل صورة اختياري
         if p.get("image_url"):
@@ -375,7 +408,7 @@ def send_missing_products(products: List[Dict]) -> Dict:
             "الوزن":           int(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1),
             "سعر التكلفة":     float(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0)))),
             "السعر المخفض":    float(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0)))),
-            "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
+            "الوصف":           _clip_desc_field(str(p.get("الوصف", p.get("description", "")))),
         }
         if p.get("image_url"):
             item["صورة المنتج"] = str(p["image_url"])
@@ -448,7 +481,7 @@ def send_batch_smart(products: list, batch_type: str = "update",
                 else:
                     fail_count += len(batch)
                     error_names.extend([p.get("name", p.get("منتج_المنافس", "?"))[:30] for p in batch])
-            except Exception:
+            except (requests.exceptions.RequestException, ValueError, KeyError, TypeError):
                 if attempt >= max_retries:
                     fail_count += len(batch)
                     error_names.extend([p.get("name", "?")[:30] for p in batch])
@@ -493,7 +526,32 @@ def verify_webhook_connection() -> Dict:
     فحص حالة الاتصال بجميع Webhooks.
     يُعيد dict: {"update_prices": {...}, "new_products": {...}, "all_connected": bool}
     (المفتاح new_products = اختبار WEBHOOK_MISSING_PRODUCTS / المفقودات)
+
+    عند WEBHOOK_VERIFY_SAFE=1|true|yes لا يُرسل POST حقيقي — تحقق شكلي من الروابط فقط.
     """
+    safe = (os.environ.get("WEBHOOK_VERIFY_SAFE") or "").strip().lower() in ("1", "true", "yes", "on")
+    u_raw = _webhook_update_url()
+    n_raw = _webhook_missing_url()
+
+    if safe:
+        u_ok = _webhook_url_allowed(u_raw)
+        n_ok = _webhook_url_allowed(n_raw)
+        return {
+            "update_prices": {
+                "success": u_ok,
+                "message": "وضع تحقق آمن — لم يُرسل طلب فعلي"
+                + (" ✅ رابط صالح" if u_ok else " ❌ رابط غير صالح أو غير https"),
+                "url": u_raw[:55] + "..." if len(u_raw) > 55 else u_raw,
+            },
+            "new_products": {
+                "success": n_ok,
+                "message": "وضع تحقق آمن — لم يُرسل طلب فعلي"
+                + (" ✅ رابط صالح" if n_ok else " ❌ رابط غير صالح أو غير https"),
+                "url": n_raw[:55] + "..." if len(n_raw) > 55 else n_raw,
+            },
+            "all_connected": u_ok and n_ok,
+        }
+
     # فحص Webhook تحديث الأسعار — Payload المطابق للـ Parameters
     test_price_payload = {
         "products": [{
