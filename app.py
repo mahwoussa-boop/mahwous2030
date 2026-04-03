@@ -21,6 +21,10 @@ import json
 import logging
 import os
 import pickle
+
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_APP_DIR, "data")
+_ANALYSIS_PAIR_COLS = frozenset({"المنتج", "منتج_المنافس"})
 import streamlit as st
 import pandas as pd
 import threading
@@ -56,7 +60,28 @@ except ImportError:
     except ImportError:
         def add_script_run_ctx(t): return t
 
-from config import *
+from config import (
+    APP_ICON,
+    APP_TITLE,
+    APP_VERSION,
+    AUTOMATION_RULES_DEFAULT,
+    COLORS,
+    DB_PATH,
+    GEMINI_MODEL,
+    HIGH_MATCH_SCORE,
+    MAKE_DOCS_SCENARIO_PRICING_AUTOMATION,
+    MAKE_DOCS_SCENARIO_UPDATE_PRICES,
+    MIN_MATCH_SCORE,
+    PRESET_COMPETITORS_FALLBACK,
+    PRESET_COMPETITORS_PATH,
+    PRICE_DIFF_THRESHOLD,
+    SECTIONS,
+    get_cohere_api_key,
+    get_gemini_api_keys,
+    get_openrouter_api_key,
+    get_webhook_missing_products,
+    get_webhook_update_prices,
+)
 from styles import get_styles, stat_card, vs_card, comp_strip, miss_card, get_sidebar_toggle_js
 from engines.engine import (read_file, run_full_analysis, find_missing_products,
                              extract_brand, extract_size, extract_type, is_sample,
@@ -193,20 +218,26 @@ def _ensure_make_webhooks_session():
     (يستخدمها utils/make_helper عند الإرسال).
     • WEBHOOK_UPDATE_PRICES → تعديل أسعار (🔴 أعلى 🟢 أقل ✅ موافق)
     • WEBHOOK_MISSING_PRODUCTS → مفقودات فقط (سيناريو أتمتة التسعير)
+    تُحدَّث القيم من الدوال عند كل استدعاء حتى تعكس تغييرات البيئة/Secrets دون إعادة تشغيل.
     """
+    fresh_u = (get_webhook_update_prices() or "").strip()
+    fresh_m = (get_webhook_missing_products() or "").strip()
     if "WEBHOOK_UPDATE_PRICES" not in st.session_state:
-        st.session_state["WEBHOOK_UPDATE_PRICES"] = get_webhook_update_prices()
+        st.session_state["WEBHOOK_UPDATE_PRICES"] = fresh_u
+    elif not (st.session_state.get("WEBHOOK_UPDATE_PRICES") or "").strip() and fresh_u:
+        st.session_state["WEBHOOK_UPDATE_PRICES"] = fresh_u
     if "WEBHOOK_MISSING_PRODUCTS" not in st.session_state:
         if st.session_state.get("WEBHOOK_NEW_PRODUCTS"):
             st.session_state["WEBHOOK_MISSING_PRODUCTS"] = st.session_state["WEBHOOK_NEW_PRODUCTS"]
         else:
-            st.session_state["WEBHOOK_MISSING_PRODUCTS"] = get_webhook_missing_products()
-    os.environ["WEBHOOK_UPDATE_PRICES"] = (
-        st.session_state.get("WEBHOOK_UPDATE_PRICES") or ""
-    ).strip()
-    _miss = (st.session_state.get("WEBHOOK_MISSING_PRODUCTS") or "").strip()
-    os.environ["WEBHOOK_MISSING_PRODUCTS"] = _miss
-    os.environ["WEBHOOK_NEW_PRODUCTS"] = _miss
+            st.session_state["WEBHOOK_MISSING_PRODUCTS"] = fresh_m
+    elif not (st.session_state.get("WEBHOOK_MISSING_PRODUCTS") or "").strip() and fresh_m:
+        st.session_state["WEBHOOK_MISSING_PRODUCTS"] = fresh_m
+    eff_u = (st.session_state.get("WEBHOOK_UPDATE_PRICES") or "").strip() or fresh_u
+    eff_m = (st.session_state.get("WEBHOOK_MISSING_PRODUCTS") or "").strip() or fresh_m
+    os.environ["WEBHOOK_UPDATE_PRICES"] = eff_u
+    os.environ["WEBHOOK_MISSING_PRODUCTS"] = eff_m
+    os.environ["WEBHOOK_NEW_PRODUCTS"] = eff_m
 
 
 _ensure_make_webhooks_session()
@@ -244,8 +275,8 @@ _db_hidden = get_hidden_product_keys()
 st.session_state.hidden_products = st.session_state.hidden_products | _db_hidden
 
 # ── نتائج جزئية أثناء الكشط → بطاقات الأقسام (ملف pickle + لقطة JSON) ──
-_LIVE_SNAP_PATH = os.path.join("data", "scrape_live_snapshot.json")
-_LIVE_SESSION_PKL = os.path.join("data", "live_session_results.pkl")
+_LIVE_SNAP_PATH = os.path.join(_DATA_DIR, "scrape_live_snapshot.json")
+_LIVE_SESSION_PKL = os.path.join(_DATA_DIR, "live_session_results.pkl")
 # خيط التحليل يكتب اللقطة بشكل متكرر؛ القفل + كتابة ذرية تمنع تداخل الكتابات وملفات تالفة
 _LIVE_SESSION_PKL_LOCK = threading.Lock()
 _CHECKPOINT_SORT_BG_LOCK = threading.Lock()
@@ -254,12 +285,15 @@ _CHECKPOINT_SORT_BG_LOCK = threading.Lock()
 import queue as _queue
 import engines.scrape_event as _scrape_event
 
-_REALTIME_EV_QUEUE = _queue.Queue()
+_REALTIME_EV_QUEUE = _queue.Queue(maxsize=5000)
 _REALTIME_RESULTS_LOCK = threading.Lock()
 
 def _on_realtime_scrape_callback(ev: dict):
     """خُطّاف يُنفَّذ من خيط الكشط الخلفي لكل منتج جديد."""
-    _REALTIME_EV_QUEUE.put(ev)
+    try:
+        _REALTIME_EV_QUEUE.put_nowait(ev)
+    except _queue.Full:
+        _logger.warning("realtime scrape event queue full (max 5000); dropping event")
 
 # تسجيل الخُطّاف ليقوم السكربر بتغذية الطابور فوراً
 _scrape_event.register_realtime_hook(_on_realtime_scrape_callback)
@@ -287,28 +321,28 @@ def _our_catalog_has_id_column(df) -> bool:
 
 def _process_realtime_queue_main_thread():
     """يُفرغ الطابور ويُحلل المنتجات واحداً بواحد في خيط الواجهة (تحديث حي)."""
-    if _REALTIME_EV_QUEUE.empty():
-        return
-    
     our_df = st.session_state.get("our_df")
     if our_df is None or our_df.empty:
-        # محاولة التحميل من الملف الافتراضي
-        our_path = os.path.join("data", "mahwous_catalog.csv")
+        our_path = os.path.join(_DATA_DIR, "mahwous_catalog.csv")
         if os.path.isfile(our_path):
             try:
                 our_df = pd.read_csv(our_path)
                 st.session_state.our_df = our_df
-            except: pass
-    
+            except (OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                pass
+
     if our_df is None or our_df.empty:
         return
 
-    # معالجة لغاية 5 أحداث في كل rerun لتجنب تجميد الواجهة
+    max_per_rerun = 5
     processed = 0
-    while not _REALTIME_EV_QUEUE.empty() and processed < 5:
-        ev = _REALTIME_EV_QUEUE.get_nowait()
+    while processed < max_per_rerun:
+        try:
+            ev = _REALTIME_EV_QUEUE.get_nowait()
+        except _queue.Empty:
+            break
         processed += 1
-        
+
         try:
             rp = ev.get("raw_product", {})
             comp_name = str(rp.get("name", "")).strip()
@@ -338,10 +372,12 @@ def _process_realtime_queue_main_thread():
                     if adf is None: adf = pd.DataFrame()
                     
                     # تجنب تكرار نفس المنتج لنفس المنافس في نفس الجلسة
-                    if not adf.empty:
-                        mask = (adf["المنتج"].astype(str) == res_df.iloc[0].get("المنتج")) & \
-                               (adf["منتج_المنافس"].astype(str) == comp_name)
-                        if mask.any(): continue
+                    if not adf.empty and _ANALYSIS_PAIR_COLS.issubset(adf.columns):
+                        mask = (adf["المنتج"].astype(str) == res_df.iloc[0].get("المنتج")) & (
+                            adf["منتج_المنافس"].astype(str) == comp_name
+                        )
+                        if mask.any():
+                            continue
                     
                     new_adf = pd.concat([adf, res_df], ignore_index=True)
                     st.session_state.analysis_df = new_adf
@@ -371,7 +407,7 @@ def _default_checkpoint_sort() -> dict:
 
 def _atomic_write_live_session_pkl(payload: dict) -> None:
     """كتابة pickle ذرية: ملف مؤقت ثم os.replace حتى لا يقرأ القارئ نصف ملف."""
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(_DATA_DIR, exist_ok=True)
     tmp = _LIVE_SESSION_PKL + ".tmp"
     with _LIVE_SESSION_PKL_LOCK:
         with open(tmp, "wb") as f:
@@ -388,7 +424,7 @@ def _hydrate_live_session_results_early():
     try:
         with open(_LIVE_SNAP_PATH, encoding="utf-8") as f:
             snap = json.load(f)
-    except Exception:
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return
     run_ok = snap.get("running") and not snap.get("done")
     done_gap = snap.get("done") and snap.get("success") and st.session_state.get("results") is None
@@ -403,8 +439,8 @@ def _hydrate_live_session_results_early():
         st.session_state.comp_dfs = blob.get("comp_dfs")
         if blob.get("our_df") is not None:
             st.session_state.our_df = blob["our_df"]
-    except Exception:
-        pass
+    except (pickle.UnpicklingError, EOFError, OSError, KeyError, TypeError, AttributeError) as e:
+        _logger.warning("hydrate live session pickle failed: %s", e)
 
 
 _hydrate_live_session_results_early()
@@ -602,6 +638,8 @@ def _apply_redistribute_analysis_row(
     if adf is None or getattr(adf, "empty", True):
         return False, "لا يوجد تحليل محمّل — شغّل المقارنة أولاً"
     dec = _MANUAL_BUCKET_DECISION[target_bucket]
+    if not _ANALYSIS_PAIR_COLS.issubset(adf.columns):
+        return False, "جدول التحليل لا يحتوي أعمدة المنتج/المنافس المطلوبة"
     try:
         adf = adf.copy()
         m = (adf["المنتج"].astype(str) == str(our_name).strip()) & (
@@ -629,6 +667,8 @@ def _merge_verified_review_into_session(confirmed: pd.DataFrame) -> int:
     adf = st.session_state.get("analysis_df")
     if adf is None or getattr(adf, "empty", True):
         return 0
+    if not _ANALYSIS_PAIR_COLS.issubset(adf.columns):
+        return 0
     adf = adf.copy()
     n = 0
     for _, crow in confirmed.iterrows():
@@ -639,7 +679,7 @@ def _merge_verified_review_into_session(confirmed: pd.DataFrame) -> int:
             continue
         try:
             mask = (adf["المنتج"].astype(str) == our_n) & (adf["منتج_المنافس"].astype(str) == comp_n)
-        except Exception:
+        except (KeyError, TypeError, ValueError):
             continue
         for ri in adf.index[mask]:
             adf.at[ri, "القرار"] = new_dec
@@ -684,7 +724,7 @@ def _hydrate_checkpoint_sort_pending() -> bool:
     try:
         with open(_LIVE_SNAP_PATH, encoding="utf-8") as f:
             snap = json.load(f)
-    except Exception:
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return False
     ck = snap.get("checkpoint_sort") or {}
     if not ck.get("pending_hydrate"):
@@ -701,7 +741,8 @@ def _hydrate_checkpoint_sort_pending() -> bool:
             st.session_state.our_df = blob["our_df"]
         _focus_sidebar_on_analysis_results(blob["results"])
         hydrated = True
-    except Exception:
+    except (pickle.UnpicklingError, EOFError, OSError, KeyError, TypeError, AttributeError) as e:
+        _logger.warning("checkpoint sort hydrate pickle failed: %s", e)
         _merge_scrape_live_snapshot(
             checkpoint_sort={
                 "pending_hydrate": False,
@@ -765,7 +806,7 @@ if os.path.isfile(_LIVE_SNAP_PATH):
             _ls = json.load(f)
         if _ls.get("running") and not _ls.get("done"):
             _skip_last_job = True
-    except Exception:
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         pass
 
 if st.session_state.results is None and not st.session_state.job_running and not _skip_last_job:
@@ -1134,8 +1175,8 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
     )
 
 
-SCRAPE_BG_CONTEXT = os.path.join("data", "scrape_bg_context.pkl")
-SCRAPE_LIVE_SNAPSHOT = os.path.join("data", "scrape_live_snapshot.json")
+SCRAPE_BG_CONTEXT = os.path.join(_DATA_DIR, "scrape_bg_context.pkl")
+SCRAPE_LIVE_SNAPSHOT = os.path.join(_DATA_DIR, "scrape_live_snapshot.json")
 # تزامن بين خيط الكشط وخيط مسار التحليل عند كتابة اللقطة JSON
 _LIVE_SNAPSHOT_LOCK = threading.Lock()
 
@@ -1553,12 +1594,12 @@ def _run_checkpoint_sort_pipeline(
     n_ck = len(ck_rows)
     if n_ck == 0:
         return False, "لا توجد صفوف مكسوبة بعد (انتظر دفعة أو تحقق من competitors_latest.csv).", 0
-    our_path = os.path.join("data", "mahwous_catalog.csv")
+    our_path = os.path.join(_DATA_DIR, "mahwous_catalog.csv")
     if not os.path.isfile(our_path):
         return False, "لا يوجد `data/mahwous_catalog.csv` — ارفع الكتالوج أولاً.", 0
     try:
         our_df = pd.read_csv(our_path)
-    except Exception as e:
+    except (OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
         return False, f"قراءة الكتالوج: {e}", 0
     if our_df.empty:
         return False, "كتالوج منتجاتنا فارغ.", 0
@@ -1704,7 +1745,7 @@ def _start_checkpoint_sort_background(*, log_action: str) -> tuple[bool, str]:
         return False, f"قراءة صفوف المنافس: {e}"
     if not ck_rows:
         return False, "لا توجد صفوف مكسوبة بعد — انتظر حتى تُكتب أول دفعة إلى الملف المباشر."
-    our_path = os.path.join("data", "mahwous_catalog.csv")
+    our_path = os.path.join(_DATA_DIR, "mahwous_catalog.csv")
     if not os.path.isfile(our_path):
         return False, "لا يوجد `data/mahwous_catalog.csv` — ارفع الكتالوج أولاً."
     comp_key = _infer_comp_key_for_checkpoint_recovery()
@@ -1743,7 +1784,7 @@ def _render_checkpoint_recovery_panel(snap_live: dict) -> None:
             "usable_row_count": 0,
             "fingerprint_match": False,
             "has_seeds_json": False,
-            "checkpoint_path": os.path.join("data", "scraper_checkpoint.json"),
+            "checkpoint_path": os.path.join(_DATA_DIR, "scraper_checkpoint.json"),
         }
     try:
         ck_rows = load_rows_for_mid_scrape_analysis()
@@ -1904,8 +1945,8 @@ def _run_scrape_chain_background():
         if not sm.startswith("http"):
             continue
 
-        os.makedirs("data", exist_ok=True)
-        with open("data/competitors_list.json", "w", encoding="utf-8") as f:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        with open(os.path.join(_DATA_DIR, "competitors_list.json"), "w", encoding="utf-8") as f:
             json.dump([sm], f, ensure_ascii=False)
 
         flush_cb = _comp_incremental_catalog_flush(comp_key)
@@ -2019,12 +2060,13 @@ def _run_scrape_chain_background():
 
         pl_dict_last = pl_dict
 
-        if not nrows or not os.path.isfile("data/competitors_latest.csv"):
+        _comp_latest = os.path.join(_DATA_DIR, "competitors_latest.csv")
+        if not nrows or not os.path.isfile(_comp_latest):
             continue
 
         try:
-            comp_df = pd.read_csv("data/competitors_latest.csv")
-        except Exception:
+            comp_df = pd.read_csv(_comp_latest)
+        except (OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError):
             continue
 
         if comp_df.empty:
@@ -2043,7 +2085,7 @@ def _run_scrape_chain_background():
     try:
         all_smaps = [j.get("sitemap") for j in scrape_queue if j.get("sitemap")]
         if all_smaps:
-            with open("data/competitors_list.json", "w", encoding="utf-8") as f:
+            with open(os.path.join(_DATA_DIR, "competitors_list.json"), "w", encoding="utf-8") as f:
                 json.dump(all_smaps, f, ensure_ascii=False)
     except Exception:
         pass
@@ -3135,7 +3177,7 @@ elif page == "📂 رفع الملفات":
     st.header("🕸️ كشط الويب والتحليل")
     db_log("upload", "view")
     _render_checkpoint_recovery_panel(_snap_live)
-    our_path = os.path.join("data", "mahwous_catalog.csv")
+    our_path = os.path.join(_DATA_DIR, "mahwous_catalog.csv")
 
     # اظهر رافع الكتالوج دائماً حتى تتمكن الاختبارات/المستخدم من رفع الملف دون الدخول في مسار البدء.
     st.markdown("### 📦 كتالوج منتجاتنا")
@@ -3150,7 +3192,7 @@ elif page == "📂 رفع الملفات":
     )
     if uploaded_catalog_main:
         try:
-            os.makedirs("data", exist_ok=True)
+            os.makedirs(_DATA_DIR, exist_ok=True)
             with open(our_path, "wb") as f:
                 f.write(uploaded_catalog_main.read())
             _tmp_df = pd.read_csv(our_path)
@@ -3160,7 +3202,7 @@ elif page == "📂 رفع الملفات":
                 )
             else:
                 st.success(f"✅ تم حفظ الكتالوج بنجاح — عدد الصفوف: {len(_tmp_df):,}")
-        except Exception as e:
+        except (OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
             st.error(f"❌ تعذر حفظ/قراءة الكتالوج: {e}")
 
     if "scraper_urls" not in st.session_state:
@@ -3348,7 +3390,7 @@ elif page == "📂 رفع الملفات":
                         key="catalog_uploader",
                     )
                     if uploaded_catalog:
-                        os.makedirs("data", exist_ok=True)
+                        os.makedirs(_DATA_DIR, exist_ok=True)
                         with open(our_path, "wb") as f:
                             f.write(uploaded_catalog.read())
                         st.success("✅ تم حفظ الكتالوج — اضغط 'بدء الكشط والتحليل' الآن")
@@ -3357,16 +3399,16 @@ elif page == "📂 رفع الملفات":
                 else:
                     try:
                         our_df_pre = pd.read_csv(our_path)
-                    except Exception as e:
+                    except (OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
                         st.error(f"❌ تعذر قراءة الكتالوج المحلي: {e}")
                         our_df_pre = None
 
                 if our_df_pre is not None:
                     if max_rows > 0:
                         our_df_pre = our_df_pre.head(int(max_rows))
-                    os.makedirs("data", exist_ok=True)
+                    os.makedirs(_DATA_DIR, exist_ok=True)
                     _all_smaps = [p[2] for p in resolved_triples]
-                    with open("data/competitors_list.json", "w", encoding="utf-8") as f:
+                    with open(os.path.join(_DATA_DIR, "competitors_list.json"), "w", encoding="utf-8") as f:
                         json.dump(_all_smaps, f, ensure_ascii=False)
 
                     _comp_label = str(
@@ -4078,7 +4120,11 @@ elif page == "⚠️ تحت المراجعة":
                         if _rc_results:
                             _moved = 0
                             adf = st.session_state.get("analysis_df")
-                            if adf is not None and not getattr(adf, "empty", True):
+                            if (
+                                adf is not None
+                                and not getattr(adf, "empty", True)
+                                and _ANALYSIS_PAIR_COLS.issubset(adf.columns)
+                            ):
                                 for rc in _rc_results:
                                     _sec = str(rc.get("section", "") or "")
                                     try:
@@ -4100,7 +4146,7 @@ elif page == "⚠️ تحت المراجعة":
                                         ) & (
                                             adf["منتج_المنافس"].astype(str) == _it["comp"]
                                         )
-                                    except Exception:
+                                    except (KeyError, TypeError, ValueError):
                                         continue
                                     for _ri in adf.index[_mask]:
                                         if "مراجعة" in str(adf.at[_ri, "القرار"]):
@@ -4385,15 +4431,16 @@ elif page == "✔️ تمت المعالجة":
 elif page == "🤖 الذكاء الصناعي":
     db_log("ai", "view")
 
-    # ── شريط الحالة ──
-    if GEMINI_API_KEYS:
+    # ── شريط الحالة (قراءة حية من البيئة/Secrets — لا تعتمد على نسخة config المخزّنة عند الاستيراد) ──
+    _gemini_keys_live = get_gemini_api_keys()
+    if _gemini_keys_live:
         st.markdown(f'''<div style="background:linear-gradient(90deg,#051505,#030d1f);
             border:1px solid #00C853;border-radius:10px;padding:10px 18px;
             margin-bottom:12px;display:flex;align-items:center;gap:10px;">
           <div style="width:10px;height:10px;border-radius:50%;background:#00C853;
                       box-shadow:0 0 8px #00C853;animation:pulse 2s infinite"></div>
           <span style="color:#00C853;font-weight:800;font-size:1rem">Gemini Flash — متصل مباشرة</span>
-          <span style="color:#555;font-size:.78rem"> | {len(GEMINI_API_KEYS)} مفاتيح | {GEMINI_MODEL}</span>
+          <span style="color:#555;font-size:.78rem"> | {len(_gemini_keys_live)} مفاتيح | {GEMINI_MODEL}</span>
         </div>''', unsafe_allow_html=True)
     else:
         st.error("❌ Gemini غير متصل — أضف GEMINI_API_KEYS في Streamlit Secrets")

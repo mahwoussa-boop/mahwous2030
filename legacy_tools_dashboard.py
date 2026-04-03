@@ -31,7 +31,7 @@ except ImportError:
 from legacy_core import (
     SALLA_SEO_COLS,
     StrictFilterOptions,
-    apply_strict_pipeline_filters,
+    legacy_apply_strict_pipeline_filters,
     format_salla_date_yyyy_mm_dd,
     normalize_price_digits,
     parse_price_numeric,

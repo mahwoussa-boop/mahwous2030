@@ -23,10 +23,21 @@ from urllib.parse import urlparse
 
 import requests
 
+
+def _safe_int_env(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 _IMPERSONATE = (os.environ.get("SCRAPER_IMPERSONATE") or "chrome131").strip() or "chrome131"
 _ASYNC_IMPERSONATE = (os.environ.get("SCRAPER_ASYNC_IMPERSONATE") or "chrome120").strip() or "chrome120"
 _DISABLE_CURL = os.environ.get("SCRAPER_DISABLE_CURL_CFFI", "").lower() in ("1", "true", "yes")
-_PW_SETTLE_MS = int(os.environ.get("SCRAPER_PW_SETTLE_MS", "2500"))
+_PW_SETTLE_MS = _safe_int_env("SCRAPER_PW_SETTLE_MS", 2500)
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -385,7 +396,7 @@ class AsyncScraperHTTP:
         return u
 
     def _rotate_ua_headers(self) -> dict[str, str]:
-        every = int(os.environ.get("SCRAPER_UA_ROTATE_EVERY") or "0")
+        every = _safe_int_env("SCRAPER_UA_ROTATE_EVERY", 0)
         if every <= 0:
             return {}
         self._request_seq += 1

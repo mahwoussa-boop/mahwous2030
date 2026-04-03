@@ -72,7 +72,11 @@ def _extract_size_ml(text: str) -> float:
     for pattern, mult in patterns:
         m = re.search(pattern, text_lower, re.IGNORECASE)
         if m:
-            return round(float(m.group(1).replace(",", ".")) * mult, 1)
+            try:
+                val = float(m.group(1).replace(",", "."))
+            except ValueError:
+                continue
+            return round(val * mult, 1)
     return 0.0
 
 
@@ -134,7 +138,10 @@ def product_name_matches_approved_brand_list(name: str, brands_list: list) -> bo
     nl = str(name or "").lower()
     for b in brands_list:
         bs = str(b).strip()
-        if bs and bs.lower() in nl:
+        if not bs:
+            continue
+        esc = re.escape(bs.lower())
+        if re.search(rf"(?<!\w){esc}(?!\w)", nl, flags=re.IGNORECASE):
             return True
     return False
 
@@ -144,7 +151,7 @@ def strict_row_has_volume_in_text(name: str, desc: str = "") -> bool:
     return _extract_size_ml(combined) > 0
 
 
-def apply_strict_pipeline_filters(
+def legacy_apply_strict_pipeline_filters(
     df: pd.DataFrame,
     name_col: str,
     desc_col: Optional[str],
@@ -160,7 +167,7 @@ def apply_strict_pipeline_filters(
     if df is None or df.empty:
         return df, empty_stats
     if name_col not in df.columns:
-        LOG.error("apply_strict_pipeline_filters: missing name col %s (%s)", name_col, label)
+        LOG.error("legacy_apply_strict_pipeline_filters: missing name col %s (%s)", name_col, label)
         return df, {**empty_stats, "input_rows": len(df), "output_rows": len(df), "error": "no_name_col"}
 
     stats = {

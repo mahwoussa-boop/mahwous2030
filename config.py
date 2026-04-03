@@ -110,22 +110,39 @@ def get_openrouter_api_key() -> str:
 
 
 def get_cohere_api_key() -> str:
-    return _s("COHERE_API_KEY") or ""
+    return _s("COHERE_API_KEY", "")
 
 
 # ══════════════════════════════════════════════
 #  المفاتيح الفعلية (من البيئة / .streamlit/secrets.toml فقط — لا مفاتيح داخل الكود)
+#  تُحدَّث عبر _refresh_runtime_secrets() لتفادي الاحتفاظ بقيم قديمة (Stale Globals)
 # ══════════════════════════════════════════════
-GEMINI_API_KEYS    = _parse_gemini_keys()
-GEMINI_API_KEY     = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
-OPENROUTER_API_KEY = get_openrouter_api_key()
-COHERE_API_KEY     = get_cohere_api_key()
-EXTRA_API_KEY      = _s("EXTRA_API_KEY")
+GEMINI_API_KEYS: list[str] = []
+GEMINI_API_KEY = ""
+OPENROUTER_API_KEY = ""
+COHERE_API_KEY = ""
+EXTRA_API_KEY = ""
 
-# NDJSON لأحداث الكشط — يقرأ من secrets ثم يضبط البيئة لـ engines/scrape_event.py
-_ndjson_flag = (_s("MAHWOUS_SCRAPE_EVENTS_NDJSON", "") or "").strip().lower()
-if _ndjson_flag in ("1", "true", "yes", "on"):
-    _os.environ.setdefault("MAHWOUS_SCRAPE_EVENTS_NDJSON", "1")
+
+def _refresh_runtime_secrets():
+    """تحديث المتغيرات العامة لضمان عدم الاحتفاظ ببيانات قديمة (Stale Globals) في الذاكرة."""
+    global GEMINI_API_KEYS, GEMINI_API_KEY, OPENROUTER_API_KEY, COHERE_API_KEY, EXTRA_API_KEY
+    GEMINI_API_KEYS = _parse_gemini_keys()
+    GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
+    OPENROUTER_API_KEY = get_openrouter_api_key()
+    COHERE_API_KEY = get_cohere_api_key()
+    EXTRA_API_KEY = _s("EXTRA_API_KEY", "")
+
+
+def _apply_scrape_events_ndjson_from_secrets() -> None:
+    """تأجيل تعديل بيئة النظام (import-time env mutations) إلى استدعاء صريح."""
+    flag = str(_s("MAHWOUS_SCRAPE_EVENTS_NDJSON", "")).strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        _os.environ.setdefault("MAHWOUS_SCRAPE_EVENTS_NDJSON", "1")
+
+
+_refresh_runtime_secrets()
+_apply_scrape_events_ndjson_from_secrets()
 
 
 # ══════════════════════════════════════════════

@@ -6,7 +6,6 @@ HTTP: جلسة واحدة ``AsyncScraperHTTP`` تُغلق في ``__aexit__`` (ل
 from __future__ import annotations
 
 import asyncio
-import copy
 import csv
 from collections import deque
 import hashlib
@@ -67,13 +66,20 @@ def _is_ld_product_node(node: dict) -> bool:
     return False
 
 
-DATA_DIR = "data"
+_SCRAPER_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(_SCRAPER_ROOT, "data")
 LIST_PATH = os.path.join(DATA_DIR, "competitors_list.json")
 OUT_CSV = os.path.join(DATA_DIR, "competitors_latest.csv")
 _COMP_CSV_FIELDS = ["اسم المنتج", "السعر", "رقم المنتج", "رابط_الصورة"]
 SCRAPER_BG_STATE_PATH = os.path.join(DATA_DIR, "scraper_bg_state.json")
 CHECKPOINT_JSON = os.path.join(DATA_DIR, "scraper_checkpoint.json")
 CHECKPOINT_CSV = os.path.join(DATA_DIR, "competitors_checkpoint.csv")
+
+
+def _rows_snapshot_shallow(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """نسخ سطحي لصفوف المنتجات — كافٍ للقطات الوسيطة (بدون deepcopy O(n²))."""
+    return [r.copy() for r in rows]
+
 
 def _env_int(name: str, default: int) -> int:
     raw = (os.environ.get(name) or "").strip()
@@ -103,6 +109,8 @@ _MAX_SITEMAP_INDEX_ENTRIES = _env_int("SCRAPER_SITEMAP_INDEX_CAP", 200000)
 _MAX_SITEMAP_BYTES = _env_int("SCRAPER_MAX_SITEMAP_BYTES", 32 * 1024 * 1024)
 # متاجر كبيرة (آلاف الملفات داخل sitemap index) تحتاج مهلة أعلى افتراضياً.
 _SITEMAP_EXPAND_TIMEOUT_SEC = _env_int("SCRAPER_SITEMAP_EXPAND_TIMEOUT_SEC", 600)
+if _SITEMAP_EXPAND_TIMEOUT_SEC <= 0:
+    _SITEMAP_EXPAND_TIMEOUT_SEC = 600
 _CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
 _MAX_CONCURRENT_FETCH = max(1, min(64, _env_int("SCRAPER_MAX_CONCURRENT_FETCH", 28)))
@@ -330,7 +338,7 @@ async def _expand_sitemap_to_page_urls_async(
     t0 = _time.time()
     _sm_prog_last = [0.0]  # خفض تكرار progress أثناء فهرسة sitemap (كان يُستدعى كل ملف)
     while q and len(page_urls) < _SITEMAP_LOC_CAP:
-        if _SITEMAP_EXPAND_TIMEOUT_SEC > 0 and (_time.time() - t0) > _SITEMAP_EXPAND_TIMEOUT_SEC:
+        if (_time.time() - t0) > _SITEMAP_EXPAND_TIMEOUT_SEC:
             break
         sm_url = q.pop(0)
         if sm_url in seen_sm:
@@ -951,7 +959,7 @@ def _pipeline_maybe_enqueue(
         return
     if len(rows) % every != 0:
         return
-    pipeline_q.put((copy.deepcopy(rows), False))
+    pipeline_q.put((_rows_snapshot_shallow(rows), False))
 
 
 async def _run_scraper_async(
@@ -1003,12 +1011,19 @@ async def _run_scraper_async(
                     stats["salla_fast"] += len(batch)
                     for p in batch:
                         u = str(p.get("url") or seed)
+                        raw_name = p.get("name")
+                        name = str(raw_name).strip() if raw_name is not None else ""
+                        raw_price = p.get("price")
+                        try:
+                            price_f = float(raw_price) if raw_price is not None else 0.0
+                        except (TypeError, ValueError):
+                            price_f = 0.0
                         salla_pre.append(
                             (
                                 u,
                                 {
-                                    "name": p["name"],
-                                    "price": p["price"],
+                                    "name": name,
+                                    "price": price_f,
                                     "image": str(p.get("image") or ""),
                                     "url": u,
                                 },
@@ -1240,7 +1255,7 @@ async def _run_scraper_async(
                 write_competitors_csv(rows)
                 if inc_cb:
                     try:
-                        inc_cb(copy.deepcopy(rows))
+                        inc_cb(_rows_snapshot_shallow(rows))
                     except Exception:
                         logger.exception(
                             "on_incremental_flush failed rows=%s", len(rows)
@@ -1281,38 +1296,65 @@ async def _run_scraper_async(
                     return page_url, None
 
         if pending and not salla_stop_early:
-            tasks = [asyncio.create_task(_bounded_fetch_one(u)) for u in pending]
             stop_early = False
+            url_iter = iter(pending)
+            active: set[asyncio.Task] = set()
+            pool_lock = asyncio.Lock()
+
+            def _start_next_fetch_task() -> None:
+                nu = next(url_iter, None)
+                if nu is not None:
+                    active.add(asyncio.create_task(_bounded_fetch_one(nu)))
+
+            for _ in range(min(_MAX_CONCURRENT_FETCH, len(pending))):
+                _start_next_fetch_task()
+
             try:
-                for fut in asyncio.as_completed(tasks):
-                    try:
-                        u, row = await fut
-                    except asyncio.CancelledError:
+                while active:
+                    done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                    n_completed = len(done)
+                    for t in done:
+                        active.discard(t)
+                        u, row = "", None
+                        try:
+                            u, row = t.result()
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            logger.exception("as_completed task failed")
+                        async with pool_lock:
+                            if stop_early:
+                                continue
+                            if u and u not in processed_urls:
+                                if _max_fetch_urls_reached(urls_processed_this_run[0]):
+                                    stop_early = True
+                                else:
+                                    processed_urls.add(u)
+                                    urls_processed_this_run[0] += 1
+                                    i_pos = max(0, urls_processed_this_run[0] - 1)
+                                    if _consume_row(u, row, i_pos) == "stop_products":
+                                        stop_early = True
+                    if stop_early:
+                        for tt in active:
+                            if not tt.done():
+                                tt.cancel()
+                        if active:
+                            await asyncio.gather(*active, return_exceptions=True)
+                        active.clear()
                         break
-                    except Exception:
-                        logger.exception("as_completed task failed")
-                        continue
-                    if u in processed_urls:
-                        continue
-                    if _max_fetch_urls_reached(urls_processed_this_run[0]):
-                        stop_early = True
-                        break
-                    processed_urls.add(u)
-                    urls_processed_this_run[0] += 1
-                    i_pos = max(0, urls_processed_this_run[0] - 1)
-                    if _consume_row(u, row, i_pos) == "stop_products":
-                        stop_early = True
-                        break
+                    for _ in range(n_completed):
+                        _start_next_fetch_task()
             finally:
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                for tt in list(active):
+                    if not tt.done():
+                        tt.cancel()
+                if active:
+                    await asyncio.gather(*active, return_exceptions=True)
 
     if pipeline_q is not None and pipeline_thread is not None:
         _pout = pipeline.setdefault("out", {})
         if rows:
-            pipeline_q.put((copy.deepcopy(rows), True))
+            pipeline_q.put((_rows_snapshot_shallow(rows), True))
         pipeline_q.put(_PIPELINE_STOP)
         pipeline_thread.join(timeout=7200)
         if pipeline_thread.is_alive():
