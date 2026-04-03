@@ -1,3 +1,6 @@
+# Cursor MCP (نسخة حقيقية بالمفاتيح — لا ترفعها؛ انسخ من mcp.json.example)
+.cursor/mcp.json
+
 __pycache__/
 *.pyc
 *.pyo

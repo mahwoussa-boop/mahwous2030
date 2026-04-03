@@ -1,19 +1,14 @@
-# Bypasses Railpack (avoids missing railpack-plan.json in the build pipeline).
-FROM python:3.12-slim-bookworm
+# Apify الافتراضي عند ربط GitHub (جذر الريبو): كاشط JSON-LD + Playwright
+# Railway يستخدم Dockerfile.railway (انظر railway.json)
+FROM apify/actor-python-playwright:3.13
 
-WORKDIR /app
+USER myuser
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+COPY --chown=myuser:myuser apify_actor/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m playwright install chromium
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install --with-deps chromium
+COPY --chown=myuser:myuser apify_actor/ ./
+RUN python -m compileall -q my_actor/
 
-COPY . .
-
-EXPOSE 8080
-
-# Railway sets PORT; default for local docker run
-CMD ["sh", "-c", "exec streamlit run app.py --server.port ${PORT:-8080} --server.address 0.0.0.0"]
+CMD ["python", "-m", "my_actor"]
