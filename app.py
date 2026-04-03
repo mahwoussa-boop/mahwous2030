@@ -3004,6 +3004,15 @@ nav_groups = {
     "⚙️ الإعدادات والأتمتة": ["🔄 الأتمتة الذكية", "⚡ أتمتة Make", "🤖 الذكاء الصناعي", "⚙️ الإعدادات"]
 }
 
+# قيم أولية فقط عند غياب المفتاح — لا نستخدم default= مع key نفسه بعد تعيين session_state (Streamlit 1.40+)
+if "nav_main_cat" not in st.session_state:
+    st.session_state["nav_main_cat"] = "🌐 الرئيسية"
+if "nav_page_pill" not in st.session_state:
+    st.session_state["nav_page_pill"] = nav_groups[st.session_state["nav_main_cat"]][0]
+if st.session_state["nav_main_cat"] not in nav_groups:
+    st.session_state["nav_main_cat"] = "🌐 الرئيسية"
+    st.session_state["nav_page_pill"] = nav_groups["🌐 الرئيسية"][0]
+
 # توجيه الشريط الجانبي بعد اكتمال التحليل → نفس القسم في المنطقة الرئيسية (توزيع المنتجات 🔴🟢…)
 _focus_nav = st.session_state.get("sidebar_page_radio")
 if _focus_nav:
@@ -3020,7 +3029,6 @@ if _focus_nav:
 main_cat = st.segmented_control(
     "الفئات الرئيسية",
     list(nav_groups.keys()),
-    default="🌐 الرئيسية",
     key="nav_main_cat",
 )
 if not main_cat:
