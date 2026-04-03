@@ -294,19 +294,13 @@ async def collect_salla_products_fast_path(
                 u = f"{origin}/_next/data/{build_id}/{rel}?page={page}"
                 code, txt = await get(u)
                 if code != 200 or not txt:
-                    if page == 1:
-                        break
                     break
                 try:
                     data = json_loads(txt)
                 except Exception:
-                    if page == 1:
-                        break
                     break
                 batch = products_from_arbitrary_json(data, origin)
                 if not batch:
-                    if page == 1:
-                        break
                     break
                 add_batch(batch)
                 if len(batch) < max(8, per_page_hint // 4):

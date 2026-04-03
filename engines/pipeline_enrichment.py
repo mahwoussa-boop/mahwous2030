@@ -14,6 +14,11 @@ from rapidfuzz import fuzz, process as rf_process
 
 logger = logging.getLogger(__name__)
 
+try:
+    from engines.prompts import MAHWOUS_EXPERT_SYSTEM as _FULL_EXPERT_SYSTEM
+except ImportError:
+    from prompts import MAHWOUS_EXPERT_SYSTEM as _FULL_EXPERT_SYSTEM  # type: ignore
+
 # ── أسماء أعمدة مرنة لـ brands.csv ─────────────────────────────────────
 _BRAND_NAME_CANDS = ("الماركة", "brand", "Brand", "name", "العلامة")
 _BRAND_DESC_CANDS = (
@@ -90,13 +95,14 @@ def enrich_with_brand_data(
             return out
 
         brand_labels: list[str] = []
-        iloc_list: list[int] = []
+        label_to_first_iloc: dict[str, int] = {}
         for bi in range(len(brands_df)):
             r = brands_df.iloc[bi]
             raw = str(r.get(bcol, "") or "").strip()
             if raw and raw.lower() not in ("nan", "none"):
                 brand_labels.append(raw)
-                iloc_list.append(bi)
+                if raw not in label_to_first_iloc:
+                    label_to_first_iloc[raw] = bi
 
         if not brand_labels:
             out["brand_page_url"] = ""
@@ -114,8 +120,12 @@ def enrich_with_brand_data(
             match = rf_process.extractOne(b, brand_labels, scorer=fuzz.token_set_ratio)
             if match and match[1] >= fuzzy_threshold:
                 lbl = match[0]
-                pos = brand_labels.index(lbl)
-                br = brands_df.iloc[iloc_list[pos]]
+                bi_row = label_to_first_iloc.get(lbl)
+                if bi_row is None:
+                    urls.append("")
+                    descs.append("")
+                    continue
+                br = brands_df.iloc[bi_row]
                 u = str(br.get(ucol, "") or "").strip() if ucol else ""
                 d = str(br.get(dcol, "") or "").strip() if dcol else ""
                 urls.append(u)
@@ -293,7 +303,16 @@ def auto_assign_category_batch(
                 txt = (r or {}).get("response") or ""
                 data = _parse_category_assign_json(txt)
                 assigns = (data or {}).get("assignments") or []
-                by_idx = {int(a.get("index", -1)): a.get("category_path", "") for a in assigns if isinstance(a, dict)}
+                by_idx: dict[int, str] = {}
+                for a in assigns:
+                    if not isinstance(a, dict):
+                        continue
+                    try:
+                        ix = int(a.get("index", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    cp = a.get("category_path", "")
+                    by_idx[ix] = str(cp or "").strip() if cp is not None else ""
                 for j, (pos, _pn, _br) in enumerate(need_api):
                     cp = str(by_idx.get(j, "") or "").strip()
                     if cp:
@@ -324,29 +343,6 @@ def auto_assign_category_batch(
     except Exception:
         logger.exception("auto_assign_category_batch failed")
         return df
-
-
-_FULL_EXPERT_SYSTEM = """أنت خبير عطور محترف مع 15+ سنة خبرة في صناعة العطور الفاخرة، متخصص في SEO و Generative Engine Optimization (GEO). تعمل حصرياً لمتجر "مهووس" (Mahwous) - الوجهة الأولى للعطور الفاخرة في السعودية.
-
-مهمتك: كتابة وصف منتج عطور شامل واحترافي (1200-1500 كلمة) يتضمن:
-
-1. فقرة افتتاحية عاطفية (الكلمة الرئيسية في أول 50 كلمة)
-2. تفاصيل المنتج (نقاط نقطية: الماركة، الجنس، العائلة العطرية، الحجم، التركيز، سنة الإصدار)
-3. رحلة العطر - الهرم العطري (Top Notes → Heart Notes → Base Notes) بلغة حسية عاطفية
-4. لماذا تختار هذا العطر؟ (4-6 نقاط تركز على الفوائد)
-5. متى وأين ترتدي هذا العطر؟ (الفصول، الأوقات، المناسبات)
-6. لمسة خبير من مهووس (تحليل حسي + الأداء + المقارنات + التوصية)
-7. الأسئلة الشائعة FAQ (6-8 أسئلة بإجابات 50-80 كلمة)
-8. روابط داخلية (3-5 روابط لتصنيفات مهووس)
-9. فقرة ختامية بالشعار: "عالمك العطري يبدأ من مهووس"
-
-القواعد الصارمة:
-- الكلمة الرئيسية: "عطر [الماركة] [اسم العطر] [التركيز] [الحجم] [للجنس]" تتكرر 5-7 مرات
-- لا إيموجي، لا شرح، لا تعليمات — فقط الوصف الجاهز
-- أسلوب: 40% راقٍ + 25% ودود + 20% عاطفي + 15% تسويقي
-- ابحث في Fragrantica Arabia عن المكونات الحقيقية للعطر
-- أكد دائماً: "أصلي 100%"، "ضمان الأصالة"
-"""
 
 
 def generate_full_product_description(

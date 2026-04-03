@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 _ENV_NDJSON = "MAHWOUS_SCRAPE_EVENTS_NDJSON"
-_DEFAULT_NDJSON_PATH = os.path.join("data", "scrape_events.ndjson")
+_ENGINES_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_ENGINES_DIR)
+_DEFAULT_NDJSON_PATH = os.path.join(_PROJECT_ROOT, "data", "scrape_events.ndjson")
 _ndjson_lock = threading.Lock()
 
 
@@ -69,7 +71,11 @@ def validate_event(ev: Any) -> bool:
     """تحقق خفيف قبل إعادة التشغيل أو ربط وسيط خارجي."""
     if not isinstance(ev, dict):
         return False
-    if int(ev.get("schema_version") or 0) != SCHEMA_VERSION:
+    try:
+        ver = int(ev.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return False
+    if ver != SCHEMA_VERSION:
         return False
     if not ev.get("event_id") or not ev.get("timestamp_utc"):
         return False
@@ -98,7 +104,11 @@ def maybe_append_ndjson_event(
         return
     out_path = path or _DEFAULT_NDJSON_PATH
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    line = json.dumps(ev, ensure_ascii=False) + "\n"
+    try:
+        line = json.dumps(ev, ensure_ascii=False) + "\n"
+    except TypeError:
+        logger.warning("maybe_append_ndjson_event: event not JSON-serializable, skip")
+        return
     with _ndjson_lock:
         with open(out_path, "a", encoding="utf-8") as f:
             f.write(line)

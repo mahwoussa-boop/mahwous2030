@@ -11,7 +11,7 @@ import pandas as pd
 
 try:
     from config import REJECT_KEYWORDS
-except Exception:
+except ImportError:
     REJECT_KEYWORDS = [
         "sample", "عينة", "عينه", "decant", "تقسيم", "split", "miniature",
         "مينياتشر", "travel size", "travel", "fial", "vial",
@@ -47,6 +47,31 @@ _OZ_SMALL_RE = re.compile(
 )
 
 
+def _phrase_is_ascii_only(s: str) -> bool:
+    return bool(s) and all(ord(c) < 128 for c in s)
+
+
+def _has_banned_phrase(text: str, phrase: str) -> bool:
+    """
+    كشف عبارة ممنوعة دون إيجابيات خاطئة شائعة للعبارات ASCII فقط (حدود كلمات \\w).
+    للعربية والنصوص غير ASCII يُستخدم البحث الجزئي كالسابق.
+    """
+    if not phrase or not text:
+        return False
+    p = str(phrase).strip()
+    if not p:
+        return False
+    hay = str(text).lower()
+    pl = p.lower()
+    if _phrase_is_ascii_only(pl):
+        try:
+            pat = r"(?<!\w)" + re.escape(pl) + r"(?!\w)"
+            return re.search(pat, hay, re.IGNORECASE) is not None
+        except re.error:
+            return pl in hay
+    return pl in hay
+
+
 def _volume_indicates_sample_size(text: str) -> bool:
     """يُستبعد إن وُجد في الاسم حجم ≤ 8 مل، أو أونصة صغيرة جداً (≤0.28 oz ≈ 8 مل)."""
     if not text:
@@ -57,14 +82,14 @@ def _volume_indicates_sample_size(text: str) -> bool:
             v = float(m.group("n").replace(",", "."))
             if 0 < v <= 8.0:
                 return True
-        except Exception:
+        except (TypeError, ValueError):
             continue
     for m in _OZ_SMALL_RE.finditer(s):
         try:
             oz = float(m.group("n").replace(",", "."))
             if 0 < oz <= 0.28:
                 return True
-        except Exception:
+        except (TypeError, ValueError):
             continue
     return False
 
@@ -148,16 +173,12 @@ def apply_strict_pipeline_filters(
     for kw in list(REJECT_KEYWORDS) + list(_EXTRA_BANNED):
         if not kw:
             continue
-        mask &= ~work.index.to_series().map(
-            lambda i: kw.lower() in row_text(i).lower()
-        )
+        mask &= ~work.index.to_series().map(lambda i: _has_banned_phrase(row_text(i), kw))
 
     for kw in _ACCESSORY_BANNED:
         if not kw:
             continue
-        mask &= ~work.index.to_series().map(
-            lambda i: kw.lower() in row_text(i).lower()
-        )
+        mask &= ~work.index.to_series().map(lambda i: _has_banned_phrase(row_text(i), kw))
 
     mask &= ~work.index.to_series().map(lambda i: _volume_indicates_sample_size(row_text(i)))
 
@@ -233,7 +254,7 @@ def ensure_export_brands(df: pd.DataFrame) -> pd.DataFrame:
         return df
     try:
         from config import KNOWN_BRANDS
-    except Exception:
+    except ImportError:
         KNOWN_BRANDS = []
     out = df.copy()
     if "الماركة" not in out.columns:
@@ -276,7 +297,7 @@ def validate_export_product_dataframe(df: pd.DataFrame) -> tuple[bool, list[str]
             p = float(str(raw_p).replace(",", "").replace("ر.س", "").strip())
             if p <= 0:
                 issues.append(f"صف {i + 1}: السعر يجب أن يكون أكبر من صفر (القيمة: {raw_p})")
-        except Exception:
+        except (TypeError, ValueError):
             issues.append(f"صف {i + 1}: السعر غير رقمي ({raw_p})")
 
         raw_date = row.get("تاريخ_الرصد", row.get("تاريخ", ""))

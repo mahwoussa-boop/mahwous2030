@@ -1,59 +1,24 @@
 ﻿"""قواعد المطابقة والمرادفات لمحرك مهووس"""
 import re
 
-REJECT_KEYWORDS = ["sample","╪╣┘è┘╪ر","╪╣┘è┘┘ç","decant","╪ز┘é╪│┘è┘à","split","miniature"]
-KNOWN_BRANDS = [
-    "Dior","Chanel","Gucci","Tom Ford","Versace","Armani","YSL","Prada","Burberry",
-    "Hermes","Creed","Montblanc","Amouage","Rasasi","Lattafa","Arabian Oud","Ajmal",
-    "Al Haramain","Afnan","Armaf","Mancera","Montale","Kilian","Jo Malone",
-    "Carolina Herrera","Paco Rabanne","Mugler","Ralph Lauren","Parfums de Marly",
-    "Nishane","Xerjoff","Byredo","Le Labo","Roja","Narciso Rodriguez",
-    "Dolce & Gabbana","Valentino","Bvlgari","Cartier","Hugo Boss","Calvin Klein",
-    "Givenchy","Lancome","Guerlain","Jean Paul Gaultier","Issey Miyake","Davidoff",
-    "Coach","Michael Kors","Initio","Memo Paris","Maison Margiela","Diptyque",
-    "Missoni","Juicy Couture","Moschino","Dunhill","Bentley","Jaguar",
-    "Boucheron","Chopard","Elie Saab","Escada","Ferragamo","Fendi",
-    "Kenzo","Lacoste","Loewe","Rochas","Roberto Cavalli","Tiffany",
-    "Van Cleef","Azzaro","Chloe","Elizabeth Arden","Swiss Arabian",
-    "Penhaligons","Clive Christian","Floris","Acqua di Parma",
-    "Ard Al Zaafaran","Nabeel","Asdaaf","Maison Alhambra",
-    "Tiziana Terenzi","Maison Francis Kurkdjian","Serge Lutens",
-    "Frederic Malle","Ormonde Jayne","Zoologist","Tauer",
-    "Banana Republic","Benetton","Bottega Veneta","Celine","Dsquared2",
-    "Ermenegildo Zegna","Sisley","Mexx","Amadou","Thameen",
-    "Nasomatto","Nicolai","Replica","Atelier Cologne","Aerin",
-    "Angel Schlesser","Annick Goutal","Antonio Banderas","Balenciaga",
-    "Bond No 9","Boadicea","Carner Barcelona","Clean","Commodity",
-    "Costume National","Creed","Derek Lam","Diptique","Estee Lauder",
-    "Franck Olivier","Giorgio Beverly Hills","Guerlain","Guess",
-    "Histoires de Parfums","Illuminum","Jimmy Choo","Kenneth Cole",
-    "Lalique","Lolita Lempicka","Lubin","Miu Miu","Moresque",
-    "Nobile 1942","Oscar de la Renta","Oud Elite","Philipp Plein",
-    "Police","Prada","Rasasi","Reminiscence","Salvatore Ferragamo",
-    "Stella McCartney","Ted Lapidus","Ungaro","Vera Wang","Viktor Rolf",
-    "Zadig Voltaire","Zegna","Ajwad","Club de Nuit","Milestone",
-    "┘╪╖╪د┘╪ر","╪د┘╪╣╪▒╪ذ┘è╪ر ┘┘╪╣┘ê╪»","╪▒╪╡╪د╪│┘è","╪ث╪ش┘à┘","╪د┘╪ص╪▒┘à┘è┘","╪ث╪▒┘à╪د┘",
-    "╪ث┘à┘ê╪د╪ش","┘â╪▒┘è╪»","╪ز┘ê┘à ┘┘ê╪▒╪»","╪»┘è┘ê╪▒","╪┤╪د┘┘è┘","╪║┘ê╪ز╪┤┘è","╪ذ╪▒╪د╪»╪د",
-    "┘à┘è╪│┘ê┘┘è","╪ش┘ê╪│┘è ┘â┘ê╪ز┘ê╪▒","┘à┘ê╪│┘â┘è┘┘ê","╪»╪د┘┘ç┘è┘","╪ذ┘╪ز┘┘è",
-    "┘â┘è┘╪▓┘ê","┘╪د┘â┘ê╪│╪ز","┘┘╪»┘è","╪د┘è┘┘è ╪╡╪╣╪ذ","╪د╪▓╪د╪▒┘ê",
-    "┘â┘è┘┘è╪د┘","┘┘è╪┤╪د┘","╪▓┘è╪▒╪ش┘ê┘","╪ذ┘┘ç╪د┘┘è╪║┘ê┘╪▓","┘à╪د╪▒┘┘è","╪ش┘è╪▒┘╪د┘",
-    "╪ز┘è╪▓┘è╪د┘╪د ╪ز╪▒┘è┘╪▓┘è","┘à╪د┘è╪▓┘ê┘ ┘╪▒╪د┘╪│┘è╪│","╪ذ╪د┘è╪▒┘è╪»┘ê","┘┘è ┘╪د╪ذ┘ê",
-    "┘à╪د┘╪│┘è╪▒╪د","┘à┘ê┘╪ز╪د┘┘è","╪▒┘ê╪ش╪د","╪ش┘ê ┘à╪د┘┘ê┘","╪س┘à┘è┘","╪ث┘à╪د╪»┘ê",
-    "┘╪د╪│┘ê┘à╪د╪ز┘ê","┘à┘è╪▓┘ê┘ ┘à╪د╪▒╪ش┘è┘╪د","┘┘è┘â┘ê┘╪د┘è",
-    "╪ش┘è┘à┘è ╪ز╪┤┘ê","┘╪د┘┘è┘â","╪ذ┘ê┘┘è╪│","┘┘è┘â╪ز┘ê╪▒ ╪▒┘ê┘┘",
-    "┘â┘┘ê┘è","╪ذ╪د┘┘╪│┘è╪د╪║╪د","┘à┘è┘ê ┘à┘è┘ê",
-]
+try:
+    from config import (
+        REJECT_KEYWORDS,
+        KNOWN_BRANDS,
+        TESTER_KEYWORDS,
+        SET_KEYWORDS,
+    )
+except ImportError:
+    REJECT_KEYWORDS = ["sample", "عينة", "decant", "تقسيم", "split", "miniature"]
+    KNOWN_BRANDS = []
+    TESTER_KEYWORDS = ["tester", "تستر", "تيستر"]
+    SET_KEYWORDS = ["set", "gift set", "طقم", "مجموعة", "coffret"]
+
 WORD_REPLACEMENTS = {}
-MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
-PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","╪ز╪│╪ز╪▒"]; SET_KEYWORDS = ["set","╪╖┘é┘à","┘à╪ش┘à┘ê╪╣╪ر"]
-
-
-
-
-
-
-
-
+MATCH_THRESHOLD = 85
+HIGH_CONFIDENCE = 95
+REVIEW_THRESHOLD = 75
+PRICE_TOLERANCE = 5
 
 
 _SYN = {

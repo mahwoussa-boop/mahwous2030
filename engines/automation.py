@@ -9,12 +9,19 @@ engines/automation.py v26.0 — محرك الأتمتة الذكي الكامل
 ✅ حماية ضد القرارات الخاطئة (حدود أمان)
 """
 import json
+import logging
 import time
 import threading
 import sqlite3
+from collections import deque
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import pandas as pd
+import requests
+
+logger = logging.getLogger(__name__)
+
+_DECISIONS_LOG_MAX = 5000
 
 try:
     from config import (AUTOMATION_RULES_DEFAULT, AUTO_DECISION_CONFIDENCE,
@@ -129,15 +136,27 @@ class AutomationEngine:
 
     def __init__(self, rules: List[dict] = None):
         self.rules = [PricingRule(r) for r in (rules or AUTOMATION_RULES_DEFAULT)]
-        self.decisions_log: List[dict] = []
+        self.decisions_log: deque = deque(maxlen=_DECISIONS_LOG_MAX)
         self._lock = threading.Lock()
 
     def evaluate_product(self, product_data: dict) -> Optional[Dict]:
         """تقييم منتج واحد ضد كل القواعد"""
-        our_price = float(product_data.get("our_price", 0))
-        comp_price = float(product_data.get("comp_price", 0))
-        match_score = float(product_data.get("match_score", 0))
-        cost_price = float(product_data.get("cost_price", 0))
+        try:
+            our_price = float(product_data.get("our_price", 0) or 0)
+        except (TypeError, ValueError):
+            our_price = 0.0
+        try:
+            comp_price = float(product_data.get("comp_price", 0) or 0)
+        except (TypeError, ValueError):
+            comp_price = 0.0
+        try:
+            match_score = float(product_data.get("match_score", 0) or 0)
+        except (TypeError, ValueError):
+            match_score = 0.0
+        try:
+            cost_price = float(product_data.get("cost_price", 0) or 0)
+        except (TypeError, ValueError):
+            cost_price = 0.0
 
         for rule in self.rules:
             decision = rule.evaluate(our_price, comp_price, match_score, cost_price)
@@ -152,7 +171,7 @@ class AutomationEngine:
                 })
                 decision = _apply_max_drop_safeguard(decision)
                 with self._lock:
-                    self.decisions_log.append(decision)
+                    self.decisions_log.append(decision)  # deque يحدّ الطول تلقائياً
                 return decision
         return None
 
@@ -160,11 +179,23 @@ class AutomationEngine:
         """تقييم دفعة من المنتجات"""
         decisions = []
         for _, row in products_df.iterrows():
+            try:
+                op = float(row.get("السعر", 0) or 0)
+            except (TypeError, ValueError):
+                op = 0.0
+            try:
+                cp = float(row.get("سعر_المنافس", 0) or 0)
+            except (TypeError, ValueError):
+                cp = 0.0
+            try:
+                ms = float(row.get("نسبة_التطابق", 0) or 0)
+            except (TypeError, ValueError):
+                ms = 0.0
             d = self.evaluate_product({
                 "name": str(row.get("المنتج", "")),
-                "our_price": float(row.get("السعر", 0) or 0),
-                "comp_price": float(row.get("سعر_المنافس", 0) or 0),
-                "match_score": float(row.get("نسبة_التطابق", 0) or 0),
+                "our_price": op,
+                "comp_price": cp,
+                "match_score": ms,
                 "product_id": str(row.get("معرف_المنتج", "")),
                 "competitor": str(row.get("المنافس", "")),
             })
@@ -175,7 +206,7 @@ class AutomationEngine:
     def get_summary(self) -> Dict:
         """ملخص إحصائي"""
         with self._lock:
-            log = list(self.decisions_log)
+            log = list(self.decisions_log)  # نسخة من deque
         if not log:
             return {"total": 0, "lower": 0, "raise": 0, "keep": 0,
                     "savings": 0, "gains": 0, "net_impact": 0}
@@ -225,11 +256,18 @@ def auto_push_decisions(decisions: List[Dict]) -> Dict:
 
     try:
         result = send_batch_smart(products, "auto_update")
-        # تسجيل الإرسال
-        for d in eligible:
-            log_automation_decision(d, pushed=True)
-        return {"success": True, "sent": len(products), "result": result,
-                "message": f"تم إرسال {len(products)} تحديث تلقائي"}
+        ok = bool(result.get("success"))
+        if ok:
+            for d in eligible:
+                log_automation_decision(d, pushed=True)
+        return {
+            "success": ok,
+            "sent": result.get("sent", 0) if ok else 0,
+            "result": result,
+            "message": result.get("message")
+            if isinstance(result, dict)
+            else (f"تم إرسال {len(products)} تحديث تلقائي" if ok else "فشل الإرسال التلقائي"),
+        }
     except Exception as e:
         return {"success": False, "sent": 0, "message": f"فشل: {str(e)[:200]}"}
 
@@ -306,13 +344,18 @@ class ScheduledSearchManager:
         try:
             results = []
             if "الفرق" in products_df.columns:
-                sorted_df = products_df.sort_values("الفرق", key=abs, ascending=False).head(top_n)
+                _abs_col = "__abs_الفرق__"
+                _tmp = products_df.assign(**{_abs_col: products_df["الفرق"].abs()})
+                sorted_df = _tmp.sort_values(_abs_col, ascending=False).drop(columns=[_abs_col]).head(top_n)
             else:
                 sorted_df = products_df.head(top_n)
 
             for _, row in sorted_df.iterrows():
                 name = str(row.get("المنتج", ""))
-                price = float(row.get("السعر", 0) or 0)
+                try:
+                    price = float(row.get("السعر", 0) or 0)
+                except (TypeError, ValueError):
+                    price = 0.0
                 if not name or price <= 0:
                     continue
                 try:
@@ -323,7 +366,7 @@ class ScheduledSearchManager:
                             "market_data": market,
                             "timestamp": datetime.now().isoformat(),
                         })
-                except Exception:
+                except (requests.exceptions.RequestException, ValueError, TypeError, KeyError):
                     continue
                 time.sleep(1)
 
@@ -364,8 +407,8 @@ def _ensure_automation_table(db=None):
                 )
             """)
             conn.commit()
-    except Exception:
-        pass
+    except sqlite3.Error as e:
+        logger.warning("automation: ensure table failed path=%r: %s", path, e)
 
 
 def log_automation_decision(decision: dict, pushed: bool = False, db=None):
@@ -387,8 +430,8 @@ def log_automation_decision(decision: dict, pushed: bool = False, db=None):
                  1 if pushed else 0)
             )
             conn.commit()
-    except Exception:
-        pass
+    except sqlite3.Error as e:
+        logger.warning("automation: log decision failed path=%r: %s", path, e)
 
 
 def get_automation_log(limit: int = 50, db=None) -> List[Dict]:
@@ -403,7 +446,8 @@ def get_automation_log(limit: int = 50, db=None) -> List[Dict]:
             "SELECT * FROM automation_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
-    except Exception:
+    except sqlite3.Error as e:
+        logger.warning("automation: get log failed path=%r: %s", path, e)
         return []
     finally:
         if conn:
@@ -436,7 +480,8 @@ def get_automation_stats(days: int = 7, db=None) -> Dict:
         ).fetchone()[0]
         return {"total": total, "lower": lower, "raise": raised,
                 "keep": total - lower - raised, "pushed": pushed}
-    except Exception:
+    except sqlite3.Error as e:
+        logger.warning("automation: get stats failed path=%r: %s", path, e)
         return {"total": 0, "lower": 0, "raise": 0, "keep": 0, "pushed": 0}
     finally:
         if conn:

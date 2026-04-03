@@ -15,6 +15,74 @@ import os as _os
 import requests, json, re, time, traceback
 from config import get_gemini_api_keys, get_openrouter_api_key, get_cohere_api_key
 
+# أخطاء متوقعة عند استدعاءات HTTP/JSON — لا تُبتلع كل شيء بـ except عريض
+_NARROW_IO = (
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+    json.JSONDecodeError,
+    requests.exceptions.RequestException,
+)
+
+
+def _clip_prompt(s, max_chars: int = 24000) -> str:
+    """يقلّص مدخلات المستخدم/النصوص الطويلة قبل إرسالها للـ API."""
+    if s is None:
+        return ""
+    t = str(s)
+    if len(t) <= max_chars:
+        return t
+    return t[: max(0, max_chars - 24)] + "\n…[تم اقتصار النص]"
+
+
+def _gemini_response_text(data: dict) -> str:
+    """استخراج آمن لنصِّ ردّ Gemini من هيكل candidates."""
+    if not isinstance(data, dict):
+        return ""
+    cands = data.get("candidates")
+    if not isinstance(cands, list) or not cands:
+        return ""
+    first = cands[0]
+    if not isinstance(first, dict):
+        return ""
+    content = first.get("content")
+    if not isinstance(content, dict):
+        return ""
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    chunks: list[str] = []
+    for p in parts:
+        if isinstance(p, dict):
+            tx = p.get("text")
+            if isinstance(tx, str) and tx:
+                chunks.append(tx)
+    return "".join(chunks)
+
+
+def _openrouter_message_content(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(msg, dict):
+        return ""
+    c = msg.get("content")
+    return c.strip() if isinstance(c, str) else ""
+
+
+def _ddg_result_line(r: dict, cap: int = 120) -> str:
+    """سطر سياق ويب من نتيجة DuckDuckGo (قد لا تحتوي title)."""
+    sn = str(r.get("snippet") or "").strip()
+    tit = str(r.get("title") or "").strip()
+    if tit:
+        return f"- {tit[:cap]}: {sn[:cap]}"
+    return f"- {sn[: cap * 2]}"
+
+
 try:
     from engines.engine import _clean_ai_json
 except ImportError:
@@ -85,8 +153,11 @@ def diagnose_ai_providers() -> dict:
             if r.status_code == 200:
                 gemini_results.append({"key": i+1, "status": "✅ يعمل"})
             elif r.status_code == 400:
-                try: msg = r.json().get("error",{}).get("message","Bad Request")
-                except: msg = r.text[:100]
+                try:
+                    body = r.json()
+                    msg = (body.get("error") or {}).get("message", "Bad Request")
+                except _NARROW_IO:
+                    msg = r.text[:100]
                 gemini_results.append({"key": i+1, "status": f"❌ 400 — {msg[:80]}"})
             elif r.status_code == 403:
                 gemini_results.append({"key": i+1, "status": "❌ 403 — مفتاح غير مصرح أو IP محظور"})
@@ -98,14 +169,17 @@ def diagnose_ai_providers() -> dict:
             elif r.status_code == 404:
                 gemini_results.append({"key": i+1, "status": f"❌ 404 — النموذج {_GM} غير متاح"})
             else:
-                try: msg = r.json().get("error",{}).get("message","")
-                except: msg = r.text[:100]
+                try:
+                    body = r.json()
+                    msg = (body.get("error") or {}).get("message", "")
+                except _NARROW_IO:
+                    msg = r.text[:100]
                 gemini_results.append({"key": i+1, "status": f"❌ {r.status_code} — {msg[:80]}"})
         except requests.exceptions.ConnectionError as e:
             gemini_results.append({"key": i+1, "status": f"❌ لا يوجد اتصال بالإنترنت أو جدار حماية: {str(e)[:60]}"})
         except requests.exceptions.Timeout:
             gemini_results.append({"key": i+1, "status": "❌ انتهت المهلة (Timeout 15s)"})
-        except Exception as e:
+        except _NARROW_IO as e:
             gemini_results.append({"key": i+1, "status": f"❌ خطأ: {str(e)[:80]}"})
     results["gemini"] = gemini_results
 
@@ -145,8 +219,9 @@ def diagnose_ai_providers() -> dict:
                     last_or = f"⚠️ 429 — تجاوز الحد ({_model})"
                     continue
                 try:
-                    msg = r.json().get("error", {}).get("message", "")
-                except Exception:
+                    body = r.json()
+                    msg = (body.get("error") or {}).get("message", "")
+                except _NARROW_IO:
                     msg = r.text[:100]
                 msg_l = (msg or "").lower()
                 if r.status_code == 404 or "no endpoints" in msg_l:
@@ -158,7 +233,7 @@ def diagnose_ai_providers() -> dict:
                 break
             except requests.exceptions.Timeout:
                 last_or = f"❌ Timeout ({_model})"
-            except Exception as e:
+            except _NARROW_IO as e:
                 last_or = f"❌ {str(e)[:80]} ({_model})"
         if not or_ok:
             results["openrouter"] = last_or or (
@@ -189,12 +264,15 @@ def diagnose_ai_providers() -> dict:
             elif r.status_code == 402:
                 results["cohere"] = "❌ 402 — رصيد Cohere منتهٍ"
             else:
-                try: msg = r.json().get("message","")
-                except: msg = r.text[:100]
-                results["cohere"] = f"❌ {r.status_code} — {msg[:80]}"
+                try:
+                    body = r.json()
+                    msg = body.get("message", "") if isinstance(body, dict) else ""
+                except _NARROW_IO:
+                    msg = r.text[:100]
+                results["cohere"] = f"❌ {r.status_code} — {str(msg)[:80]}"
         except requests.exceptions.ConnectionError:
             results["cohere"] = "❌ لا اتصال بـ api.cohere.com"
-        except Exception as e:
+        except _NARROW_IO as e:
             results["cohere"] = f"❌ {str(e)[:80]}"
     else:
         results["cohere"] = "⚠️ مفتاح غير موجود"
@@ -222,7 +300,7 @@ def _vision_fetch_image(url: str):
         if "webp" in ct:
             return r.content, "image/webp"
         return r.content, "image/jpeg"
-    except Exception:
+    except _NARROW_IO:
         return None, "image/jpeg"
 
 
@@ -277,7 +355,10 @@ def vision_match_court(
             r = requests.post(f"{_GVU}?key={key}", json=payload, timeout=45)
             if r.status_code != 200:
                 continue
-            txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            data = r.json()
+            txt = _gemini_response_text(data)
+            if not txt:
+                continue
             clean = _clean_ai_json(txt)
             try:
                 obj = json.loads(clean)
@@ -289,7 +370,7 @@ def vision_match_court(
             out["reason"] = str(obj.get("reason", "")).strip() or "—"
             out["ok"] = True
             return out
-        except Exception as e:
+        except _NARROW_IO as e:
             _log_err("vision_match_court", str(e)[:120])
             continue
 
@@ -301,6 +382,8 @@ def vision_match_court(
 # ══ استدعاءات AI ═══════════════════════════════════════════════════════════
 from engines.prompts import MAHWOUS_EXPERT_SYSTEM, MISSING_PAGE_SYSTEM, PAGE_PROMPTS
 def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens=8192):
+    # لا نقتصّ الـ system الطويل (مثل MAHWOUS_EXPERT_SYSTEM) — فقط مدخلات المستخدم/البيانات الديناميكية
+    prompt = _clip_prompt(prompt, 24000)
     full = f"{system}\n\n{prompt}" if system else prompt
     payload = {
         "contents": [{"parts": [{"text": full}]}],
@@ -321,13 +404,11 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
             r = requests.post(f"{_GU}?key={key}", json=payload, timeout=45)
             if r.status_code == 200:
                 data = r.json()
-                if data.get("candidates"):
-                    parts = data["candidates"][0]["content"]["parts"]
-                    return "".join(p.get("text","") for p in parts)
-                else:
-                    # blocked / safety filter
-                    reason = data.get("promptFeedback",{}).get("blockReason","")
-                    _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
+                text = _gemini_response_text(data)
+                if text:
+                    return text
+                reason = (data.get("promptFeedback") or {}).get("blockReason", "") if isinstance(data, dict) else ""
+                _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
             elif r.status_code == 429:
                 _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — انتظار 2 ثانية")
                 time.sleep(2)  # ← 2 ثانية للـ 429
@@ -338,15 +419,16 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
                 _log_err("Gemini", f"مفتاح {i+1}: نموذج غير متاح {_GM} (404)")
             else:
                 try:
-                    msg = r.json().get("error",{}).get("message","")
-                except Exception:
+                    body = r.json()
+                    msg = (body.get("error") or {}).get("message", "")
+                except _NARROW_IO:
                     msg = r.text[:100]
                 _log_err("Gemini", f"مفتاح {i+1}: {r.status_code} — {msg[:80]}")
         except requests.exceptions.ConnectionError as e:
             _log_err("Gemini", f"مفتاح {i+1}: لا اتصال — {str(e)[:80]}")
         except requests.exceptions.Timeout:
             _log_err("Gemini", f"مفتاح {i+1}: Timeout (45s)")
-        except Exception as e:
+        except _NARROW_IO as e:
             _log_err("Gemini", f"مفتاح {i+1}: {str(e)[:80]}")
     return None
 
@@ -354,6 +436,8 @@ def _call_openrouter(prompt, system=""):
     or_key = get_openrouter_api_key()
     if not or_key:
         return None
+
+    prompt = _clip_prompt(prompt, 24000)
 
     msgs = []
     if system:
@@ -376,7 +460,8 @@ def _call_openrouter(prompt, system=""):
             }, timeout=45)
 
             if r.status_code == 200:
-                content = r.json()["choices"][0]["message"]["content"]
+                data = r.json()
+                content = _openrouter_message_content(data)
                 if content and content.strip():
                     return content
             elif r.status_code == 429:
@@ -396,8 +481,9 @@ def _call_openrouter(prompt, system=""):
                 return None  # لا فائدة من تجربة نماذج أخرى
             else:
                 try:
-                    msg = r.json().get("error", {}).get("message", "")
-                except Exception:
+                    body = r.json()
+                    msg = (body.get("error") or {}).get("message", "")
+                except _NARROW_IO:
                     msg = r.text[:100]
                 msg_l = (msg or "").lower()
                 if r.status_code == 404 or "no endpoints" in msg_l:
@@ -411,7 +497,7 @@ def _call_openrouter(prompt, system=""):
         except requests.exceptions.Timeout:
             _log_err("OpenRouter", f"{model}: Timeout (45s)")
             continue
-        except Exception as e:
+        except _NARROW_IO as e:
             _log_err("OpenRouter", f"{model}: {str(e)[:80]}")
             continue
 
@@ -428,6 +514,7 @@ def _call_cohere(prompt, system=""):
     ch_key = get_cohere_api_key()
     if not ch_key:
         return None
+    prompt = _clip_prompt(prompt, 24000)
     try:
         messages = []
         if system:
@@ -443,7 +530,14 @@ def _call_cohere(prompt, system=""):
         )
         if r.status_code == 200:
             data = r.json()
-            return data.get("message", {}).get("content", [{}])[0].get("text", "")
+            if not isinstance(data, dict):
+                return None
+            msg_obj = data.get("message")
+            parts = msg_obj.get("content") if isinstance(msg_obj, dict) else None
+            if isinstance(parts, list) and parts and isinstance(parts[0], dict):
+                tx = parts[0].get("text")
+                return tx if isinstance(tx, str) else ""
+            return ""
         elif r.status_code == 401:
             _COHERE_KEY_INVALID = True
             _log_err("Cohere", "مفتاح غير صحيح (401) — تجاوز Cohere")
@@ -456,10 +550,13 @@ def _call_cohere(prompt, system=""):
             time.sleep(2)
             return None
         else:
-            try:   msg = r.json().get("message", "")
-            except Exception: msg = r.text[:100]
-            _log_err("Cohere", f"{r.status_code} — {msg[:80]}")
-    except Exception as e:
+            try:
+                body = r.json()
+                msg = body.get("message", "") if isinstance(body, dict) else ""
+            except _NARROW_IO:
+                msg = r.text[:100]
+            _log_err("Cohere", f"{r.status_code} — {str(msg)[:80]}")
+    except _NARROW_IO as e:
         _log_err("Cohere", f"Fallback صامت — {str(e)[:60]}")
     return None
 
@@ -469,26 +566,42 @@ def _parse_json(txt):
     try:
         clean = _clean_ai_json(txt)
         return json.loads(clean)
-    except Exception as e:
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
         _log_err("_parse_json", str(e)[:120])
     return None
 
 def _search_ddg(query, num_results=5):
     """بحث DuckDuckGo مجاني"""
     try:
-        r = requests.get("https://api.duckduckgo.com/", params={
-            "q": query, "format": "json", "no_html": "1", "skip_disambig": "1"
-        }, timeout=8)
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
+            timeout=8,
+        )
         if r.status_code == 200:
             data = r.json()
-            results = []
+            if not isinstance(data, dict):
+                return []
+            results: list[dict] = []
             if data.get("AbstractText"):
-                results.append({"snippet": data["AbstractText"], "url": data.get("AbstractURL","")})
-            for rel in data.get("RelatedTopics", [])[:num_results]:
+                results.append(
+                    {
+                        "title": str(data.get("Heading") or "").strip(),
+                        "snippet": data["AbstractText"],
+                        "url": data.get("AbstractURL", ""),
+                    }
+                )
+            for rel in (data.get("RelatedTopics") or [])[:num_results]:
                 if isinstance(rel, dict) and rel.get("Text"):
-                    results.append({"snippet": rel.get("Text",""), "url": rel.get("FirstURL","")})
+                    results.append(
+                        {
+                            "title": "",
+                            "snippet": rel.get("Text", ""),
+                            "url": rel.get("FirstURL", ""),
+                        }
+                    )
             return results
-    except Exception:
+    except _NARROW_IO:
         pass
     return []
 
@@ -511,6 +624,8 @@ def call_ai(prompt, page="general"):
 
 # ══ Gemini Chat ══════════════════════════════════════════════════════════════
 def gemini_chat(message, history=None, system_extra=""):
+    message = _clip_prompt(message, 24000)
+    system_extra = _clip_prompt(system_extra, 8000) if system_extra else ""
     sys = PAGE_PROMPTS["general"]
     if system_extra:
         sys = f"{sys}\n\nسياق: {system_extra}"
@@ -530,14 +645,17 @@ def gemini_chat(message, history=None, system_extra=""):
             r = requests.post(f"{_GU}?key={key}", json=payload, timeout=40)
             if r.status_code == 200:
                 data = r.json()
-                if data.get("candidates"):
-                    parts = data["candidates"][0]["content"]["parts"]
-                    text = "".join(p.get("text","") for p in parts)
-                    return {"success":True,"response":text,
-                            "source":"Gemini Flash" + (" + بحث ويب" if needs_web else "")}
+                text = _gemini_response_text(data)
+                if text:
+                    return {
+                        "success": True,
+                        "response": text,
+                        "source": "Gemini Flash" + (" + بحث ويب" if needs_web else ""),
+                    }
             elif r.status_code == 429:
                 time.sleep(1); continue
-        except: continue
+        except _NARROW_IO:
+            continue
     r = _call_openrouter(message, sys)
     if r: return {"success":True,"response":r,"source":"OpenRouter"}
     return {"success":False,"response":"فشل الاتصال","source":"none"}
@@ -762,6 +880,8 @@ def generate_mahwous_description(product_name, price, fragrantica_data=None, ext
 # ══ تحقق منتج + تحديد القسم الصحيح ════════════════════════════════════════
 def verify_match(p1, p2, pr1=0, pr2=0):
     from utils.decision_labels import ui_decision_from_verify_section
+    p1 = _clip_prompt(p1, 12000)
+    p2 = _clip_prompt(p2, 12000)
     diff = pr1 - pr2 if pr1 > 0 and pr2 > 0 else 0
     if pr1 > 0 and pr2 > 0:
         if diff > 10:     expected = "سعر اعلى"
@@ -851,7 +971,7 @@ def apply_gemini_reclassify_to_analysis_df(analysis_df, min_confidence: float = 
         return analysis_df
     try:
         mask = analysis_df["القرار"].astype(str).str.contains("مراجعة", na=False)
-    except Exception:
+    except (TypeError, ValueError, KeyError, AttributeError):
         return analysis_df
     row_indices = analysis_df.index[mask].tolist()
     if not row_indices:
@@ -878,7 +998,7 @@ def apply_gemini_reclassify_to_analysis_df(analysis_df, min_confidence: float = 
             })
         try:
             results = reclassify_review_items(items)
-        except Exception:
+        except _NARROW_IO:
             continue
         if not results:
             continue
@@ -908,22 +1028,29 @@ def apply_gemini_reclassify_to_analysis_df(analysis_df, min_confidence: float = 
 # ══ بحث أسعار السوق ══════════════════════════════════════════════════════
 def search_market_price(product_name, our_price=0):
     # البحث في أشهر المتاجر السعودية (سلة، زد، نايس ون، قولدن سنت، خبير العطور)
-    queries = [
-        f"سعر {product_name} السعودية نايس ون قولدن سنت سلة",
-        f"سعر {product_name} في المتاجر السعودية 2026",
-        f"مقارنة أسعار {product_name} السعودية",
-        f"{product_name} price Saudi Arabia perfume shop",
-    ]
-    all_results = []
-    for q in queries[:3]:  # استخدام أول 3 استعلامات
-        ddg = _search_ddg(q)
-        if ddg: all_results.extend(ddg[:3])
-    
-    web_ctx = "\n".join(f"- {r['title']}: {r['snippet'][:120]}" for r in all_results) if all_results else ""
-    
-    prompt = f"""تحليل سوق دقيق للمنتج في السعودية (مارس 2026):
+    try:
+        op = float(our_price or 0)
+    except (TypeError, ValueError):
+        op = 0.0
+    try:
+        product_name = _clip_prompt(product_name, 4000)
+        queries = [
+            f"سعر {product_name} السعودية نايس ون قولدن سنت سلة",
+            f"سعر {product_name} في المتاجر السعودية 2026",
+            f"مقارنة أسعار {product_name} السعودية",
+            f"{product_name} price Saudi Arabia perfume shop",
+        ]
+        all_results = []
+        for q in queries[:3]:  # استخدام أول 3 استعلامات
+            ddg = _search_ddg(q)
+            if ddg:
+                all_results.extend(ddg[:3])
+
+        web_ctx = "\n".join(_ddg_result_line(r, 120) for r in all_results) if all_results else ""
+
+        prompt = f"""تحليل سوق دقيق للمنتج في السعودية (مارس 2026):
 المنتج: {product_name}
-سعرنا الحالي: {our_price:.0f} ريال
+سعرنا الحالي: {op:.0f} ريال
 
 المعلومات المستخرجة من الويب:
 {web_ctx}
@@ -935,16 +1062,23 @@ def search_market_price(product_name, our_price=0):
 4. حالة التوفر (متوفر/غير متوفر).
 5. توصية تسعير ذكية لمتجر مهووس ليكون الأكثر تنافسية.
 6. نسبة الثقة في البيانات (0-100)."""
-    sys = PAGE_PROMPTS["market_search"]
-    txt = _call_gemini(prompt, sys, grounding=True)
-    if not txt: txt = _call_gemini(prompt, sys)
-    if not txt: txt = _call_openrouter(prompt, sys)
-    if not txt: return {"success":False,"market_price":0}
-    data = _parse_json(txt)
-    if data:
-        data["web_context"] = web_ctx
-        return {"success":True, **data}
-    return {"success":True,"market_price":our_price,"recommendation":txt[:400],"web_context":web_ctx}
+        sys = PAGE_PROMPTS["market_search"]
+        txt = _call_gemini(prompt, sys, grounding=True)
+        if not txt: txt = _call_gemini(prompt, sys)
+        if not txt: txt = _call_openrouter(prompt, sys)
+        if not txt: return {"success": False, "market_price": 0}
+        data = _parse_json(txt)
+        if data:
+            data["web_context"] = web_ctx
+            return {"success": True, **data}
+        return {
+            "success": True,
+            "market_price": op,
+            "recommendation": txt[:400],
+            "web_context": web_ctx,
+        }
+    except (requests.exceptions.RequestException, ValueError, TypeError, KeyError):
+        return {"success": False, "market_price": 0}
 
 # ══ تحليل عميق ══════════════════════════════════════════════════════════════
 def ai_deep_analysis(our_product, our_price, comp_product, comp_price, section="general", brand=""):
@@ -1003,6 +1137,11 @@ def generate_missing_product_description(
     """
     يولّد وصفاً كاملاً + JSON SEO عبر call_ai(page='missing') وMISSING_PAGE_SYSTEM.
     """
+    product_name = _clip_prompt(product_name, 4000)
+    brand = _clip_prompt(brand, 2000)
+    size_concentration = _clip_prompt(size_concentration, 2000)
+    competitor_name = _clip_prompt(competitor_name, 2000)
+    extra_context = _clip_prompt(extra_context, 8000)
     prompt = f"""اكتب وصف المنتج المفقود التالي وفق النظام والهيكل المحددين.
 
 **الاسم:** {product_name}
@@ -1033,10 +1172,13 @@ def bulk_verify(items, section="general"):
 
 # ══ معالجة النص الملصوق ═══════════════════════════════════════════════════
 def analyze_paste(text, context=""):
+    text = _clip_prompt(text, 24000)
+    context = _clip_prompt(context, 4000)
     prompt = f"""المستخدم لصق هذا النص:
 ---
-{text[:5000]}
+{text}
 ---
+{f"سياق إضافي: {context}" if context.strip() else ""}
 حلل واستخرج: قائمة منتجات؟ اسعار؟ اوامر؟ اعط توصيات مفيدة. اجب بالعربية منظم."""
     return call_ai(prompt, "general")
 

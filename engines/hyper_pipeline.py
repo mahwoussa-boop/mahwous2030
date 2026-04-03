@@ -14,16 +14,23 @@ engines/hyper_pipeline.py - V26 Hyper-Intelligence Pipeline
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-# جذر المشروع — يضمن `from engines.*` و`utils` عند التشغيل كـ script
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+
+if __name__ == "__main__":
+    # عند التشغيل كسكربت فقط: إضافة الجذر + تهيئة السجلات (لا آثار جانبية عند الاستيراد كوحدة)
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[HyperPipeline] %(asctime)s - %(levelname)s - %(message)s",
+    )
 
 import httpx
 
@@ -39,10 +46,6 @@ try:
 except ImportError:
     HTMLParser = None  # type: ignore
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[HyperPipeline] %(asctime)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger("HyperPipeline")
 
 
@@ -197,7 +200,7 @@ class _HttpxFetcherForSalla:
         try:
             r = await self._c.get(url, timeout=timeout)
             return r.status_code, r.text
-        except Exception as exc:
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
             logger.debug("[HyperScraper] get_text_once failed url=%s err=%s", url, exc)
             return 0, None
 
@@ -219,19 +222,29 @@ class AsyncHyperScraper:
         """GET لـ URL يعيد JSON خاماً (مثلاً endpoint من Network tab)."""
         try:
             r = await client.get(url, timeout=30.0)
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            logger.debug("[HyperScraper] direct JSON GET failed: %s", exc)
+            return []
+        try:
             if r.status_code != 200:
                 return []
             txt = (r.text or "").lstrip()
             if not txt.startswith("{"):
                 return []
+            data = None
             try:
                 from utils.jsonfast import loads as json_loads
 
                 data = json_loads(txt)
-            except Exception:
-                import json
-
-                data = json.loads(txt)
+            except ImportError:
+                pass
+            except (ValueError, json.JSONDecodeError, TypeError):
+                data = None
+            if data is None:
+                try:
+                    data = json.loads(txt)
+                except (ValueError, json.JSONDecodeError, TypeError):
+                    return []
             origin = origin_from_url(url)
             if not origin:
                 from urllib.parse import urlparse
@@ -241,7 +254,7 @@ class AsyncHyperScraper:
             if not origin:
                 return []
             return products_from_arbitrary_json(data, origin)
-        except Exception as exc:
+        except (ValueError, json.JSONDecodeError, TypeError) as exc:
             logger.debug("[HyperScraper] direct JSON parse failed: %s", exc)
             return []
 
@@ -307,16 +320,22 @@ class AsyncHyperScraper:
                 nq = 0
                 for it in items:
                     name = str(it.get("name") or "").strip()
-                    price = float(it.get("price") or 0)
+                    try:
+                        price = float(it.get("price") or 0)
+                    except (TypeError, ValueError):
+                        continue
                     if not name or price <= 0:
                         continue
-                    await self.queue.put(
-                        {
-                            "raw_name": name,
-                            "price_sar": price,
-                            "url": str(it.get("url") or ""),
-                            "image": str(it.get("image") or ""),
-                        }
+                    await asyncio.wait_for(
+                        self.queue.put(
+                            {
+                                "raw_name": name,
+                                "price_sar": price,
+                                "url": str(it.get("url") or ""),
+                                "image": str(it.get("image") or ""),
+                            }
+                        ),
+                        timeout=120.0,
                     )
                     nq += 1
                 logger.info("[HyperScraper] queued %s product(s).", nq)
