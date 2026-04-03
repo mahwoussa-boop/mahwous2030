@@ -1,0 +1,15 @@
+مختصر — ربط Cursor (MCP)
+
+1) على GitHub ارفع فقط:
+   - .cursor/mcp.json.example  (قالب بدون أسرار حقيقية)
+   - هذا الملف MCP_GITHUB_AR.txt
+
+2) لا ترفع أبداً:
+   - .cursor/mcp.json  (النسخة التي فيها مفاتيحك — محظورة في .gitignore)
+
+3) على جهازك فقط:
+   - انسخ mcp.json.example إلى:  C:\Users\Hp\.cursor\mcp.json
+   - استبدل النصين:  PASTE_TESTSPRITE_API_KEY_HERE  و  PASTE_APIFY_TOKEN_FULL_STRING_HERE
+   - أعد تشغيل Cursor
+
+Railway: توكن Apify لـ MCP خاص بـ Cursor فقط؛ ضع في Railway فقط متغيرات التطبيق (مثل API_KEY للذكاء الاصطناعي).
