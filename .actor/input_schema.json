@@ -1,0 +1,26 @@
+{
+    "title": "Mahwous JSON-LD scraper input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "startUrls": {
+            "title": "Start URLs",
+            "type": "array",
+            "description": "Store or product page URLs (JSON-LD Product extraction).",
+            "editor": "requestListSources",
+            "prefill": [{ "url": "https://example.com" }],
+            "items": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "title": "URL",
+                        "description": "Full https URL"
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    "required": ["startUrls"]
+}
