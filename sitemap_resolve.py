@@ -8,7 +8,7 @@ import os
 import re
 import traceback
 from collections.abc import Callable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from browser_like_http import (
     create_scraper_session,
@@ -54,6 +54,20 @@ def _is_sitemap_body(body: bytes) -> bool:
     if b"<html" in low[:3000] or b"<!doctype html" in low[:3000]:
         return False
     return b"urlset" in low or b"sitemapindex" in low
+
+
+def _looks_like_direct_sitemap_url(url: str) -> bool:
+    p = urlparse((url or "").strip())
+    path = (p.path or "").lower()
+    return path.endswith(".xml") and ("sitemap" in path or "blog-" in path)
+
+
+def _clean_url_for_probe(url: str) -> str:
+    p = urlparse((url or "").strip())
+    if not p.netloc:
+        return (url or "").strip()
+    path = p.path.rstrip("/") or "/"
+    return urlunparse((p.scheme or "https", p.netloc, path, "", "", ""))
 
 
 def _extract_sitemap_hrefs(html: str, origin: str) -> list[str]:
@@ -123,12 +137,21 @@ def _discover_with_fetch(full: str, origin: str, fetch: _UserFetch) -> tuple[str
             consec_block = 0
         return consec_block >= 2
 
-    code, prefix, bl = fetch(full, 24576)
-    blocked_any = blocked_any or bl
-    if code == 200 and _is_sitemap_body(prefix):
-        return full, f"✅ الرابط يشير مباشرةً إلى خريطة موقع صالحة: {full}", blocked_any
-    if wall_hit(code):
-        return None, _CF_MSG, blocked_any
+    direct_probe = _clean_url_for_probe(full)
+    if _looks_like_direct_sitemap_url(direct_probe):
+        code, prefix, bl = fetch(direct_probe, 24576)
+        blocked_any = blocked_any or bl
+        if code == 200 and _is_sitemap_body(prefix):
+            return direct_probe, f"✅ الرابط يشير مباشرةً إلى خريطة موقع صالحة: {direct_probe}", blocked_any
+        if wall_hit(code):
+            return None, _CF_MSG, blocked_any
+    else:
+        code, prefix, bl = fetch(full, 24576)
+        blocked_any = blocked_any or bl
+        if code == 200 and _is_sitemap_body(prefix):
+            return full, f"✅ الرابط يشير مباشرةً إلى خريطة موقع صالحة: {full}", blocked_any
+        if wall_hit(code):
+            return None, _CF_MSG, blocked_any
 
     robots_url = urljoin(origin + "/", "robots.txt")
     try:
@@ -183,14 +206,14 @@ def _discover_with_fetch(full: str, origin: str, fetch: _UserFetch) -> tuple[str
 
     candidates = [
         "sitemap.xml",
+        "sitemap_index.xml",
         "sitemap_products.xml",
         "sitemap-products.xml",
-        "sitemap_index.xml",
         "wp-sitemap.xml",
         "sitemaps/sitemap.xml",
+        "sitemap/products.xml",
         "product-sitemap.xml",
         "products.xml",
-        "sitemap/products.xml",
         "sitemap1.xml",
     ]
     for path in candidates:

@@ -127,6 +127,7 @@ _PIPELINE_AI_PARTIAL = os.environ.get("SCRAPER_PIPELINE_AI_PARTIAL", "").strip()
 
 _PIPELINE_STOP = object()
 _RECENT_HTTP_STATUS = deque(maxlen=10)
+_ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _SALLA_FAST_PATH = (os.environ.get("SCRAPER_SALLA_FAST_PATH") or "1").strip().lower() not in (
     "0",
     "false",
@@ -233,6 +234,76 @@ async def _async_backoff_sleep(attempt: int) -> None:
     await asyncio.sleep(base + jitter)
 
 
+def _normalize_numeric_text(raw: Any) -> str:
+    """توحيد الأرقام/الفواصل العربية قبل التحويل إلى float."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    s = s.translate(_ARABIC_INDIC_DIGITS)
+    s = s.replace("\u066b", ".").replace("\u066c", ",")  # decimal/group separators
+    s = s.replace("\u00a0", "").replace(" ", "")
+    return s
+
+
+def _parse_price_float(raw: Any) -> float | None:
+    s = _normalize_numeric_text(raw)
+    if not s:
+        return None
+    s = re.sub(r"[^\d,.\-]", "", s)
+    if not s:
+        return None
+    if "," in s and "." in s:
+        s = s.replace(",", "")
+    elif "," in s and "." not in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _looks_like_block_page(html: str) -> bool:
+    if not html:
+        return False
+    h = html.lower()
+    markers = (
+        "cf-challenge",
+        "attention required",
+        "cloudflare",
+        "captcha",
+        "verify you are human",
+        "challenge-form",
+        "/cdn-cgi/challenge",
+        "security check",
+        "access denied",
+    )
+    hit = sum(1 for m in markers if m in h)
+    return hit >= 2
+
+
+def _registrable_domain(host: str) -> str:
+    p = [x for x in (host or "").lower().split(".") if x]
+    if len(p) < 2:
+        return host.lower()
+    return ".".join(p[-2:])
+
+
+def _same_store_domain(seed_host: str, page_url: str) -> bool:
+    """قبول www/subdomain لنفس المتجر ورفض التحويلات لخارج النطاق."""
+    try:
+        h = (urlparse(page_url).hostname or "").lower()
+    except Exception:
+        return False
+    if not h:
+        return False
+    sh = (seed_host or "").lower()
+    if h == sh:
+        return True
+    if h.endswith("." + sh) or sh.endswith("." + h):
+        return True
+    return _registrable_domain(h) == _registrable_domain(sh)
+
+
 async def _async_http_get_armored(
     fetcher: AsyncScraperHTTP,
     url: str,
@@ -254,6 +325,10 @@ async def _async_http_get_armored(
                 await _async_backoff_sleep(attempt)
                 continue
             if last_status == 200 and text:
+                if _looks_like_block_page(text):
+                    _RECENT_HTTP_STATUS.append(429)
+                    await _async_backoff_sleep(attempt + 1)
+                    continue
                 return 200, text
             if last_status == 200 and not text:
                 await _async_backoff_sleep(attempt)
@@ -501,7 +576,7 @@ def _extract_from_json_ld(html: str, page_url: str | None = None) -> dict[str, A
                     try:
                         out.setdefault(
                             "price",
-                            float(str(p).replace(",", "").replace("\u00a0", "")),
+                            _parse_price_float(p),
                         )
                     except Exception:
                         logger.warning(
@@ -518,7 +593,7 @@ def _extract_from_json_ld(html: str, page_url: str | None = None) -> dict[str, A
                         try:
                             out.setdefault(
                                 "price",
-                                float(str(p).replace(",", "").replace("\u00a0", "")),
+                                _parse_price_float(p),
                             )
                         except Exception:
                             logger.warning(
@@ -575,7 +650,9 @@ def _extract_meta_fallback(html: str, page_url: str | None = None) -> dict[str, 
         m = re.search(pat, html, re.I)
         if m:
             try:
-                out["price"] = float(m.group(1))
+                p = _parse_price_float(m.group(1))
+                if p is not None:
+                    out["price"] = p
                 break
             except Exception:
                 logger.warning(
@@ -663,10 +740,27 @@ def _load_sitemap_seeds() -> list[str]:
                 )
                 if isinstance(d, str) and d.startswith("http"):
                     seeds.append(d.strip())
+    # دعم إدخال store_url/domain مباشرة: حوِّله إلى sitemap صالح تلقائياً إن أمكن
+    normalized: list[str] = []
+    for s in seeds:
+        u = (s or "").strip()
+        if not u.startswith("http"):
+            continue
+        if ".xml" in u.lower() and "sitemap" in u.lower():
+            normalized.append(u)
+            continue
+        try:
+            from sitemap_resolve import resolve_store_to_sitemap_url
+
+            sm, _msg = resolve_store_to_sitemap_url(u)
+            normalized.append((sm or u).strip())
+        except Exception:
+            logger.exception("seed sitemap auto-resolve failed seed=%s", u[:220])
+            normalized.append(u)
     # إزالة التكرار مع الحفاظ على الترتيب
     seen: set[str] = set()
     out: list[str] = []
-    for s in seeds:
+    for s in normalized:
         if s not in seen:
             seen.add(s)
             out.append(s)
@@ -988,7 +1082,16 @@ async def _run_scraper_async(
         "skip_non_product": 0,
         "skip_zero_price": 0,
         "salla_fast": 0,
+        "skip_foreign_domain": 0,
     }
+    seed_hosts: set[str] = set()
+    for s in seeds:
+        try:
+            h = (urlparse(s).hostname or "").lower().strip()
+            if h:
+                seed_hosts.add(h)
+        except Exception:
+            logger.exception("failed to parse seed host seed=%r", s)
 
     async with AsyncScraperHTTP() as fetcher:
         from engines.salla_storefront import collect_salla_products_fast_path
@@ -1203,6 +1306,9 @@ async def _run_scraper_async(
         def _consume_row(u: str, row: dict[str, Any] | None, i_pos: int):
             nonlocal last_name
             if row:
+                if seed_hosts and not any(_same_store_domain(h, u) for h in seed_hosts):
+                    stats["skip_foreign_domain"] += 1
+                    return None
                 name = str(row.get("name", "")).strip()
                 if name:
                     last_name = name
@@ -1223,6 +1329,9 @@ async def _run_scraper_async(
                         stats["skip_non_product"] += 1
                         return None
                     if price_f <= 0:
+                        stats["skip_zero_price"] += 1
+                        return None
+                    if price_f > 100000:
                         stats["skip_zero_price"] += 1
                         return None
                     img = str(row.get("image", "") or "")
@@ -1374,6 +1483,7 @@ async def _run_scraper_async(
             f"rejected={stats['heuristic_rejected']} salla_fast={stats.get('salla_fast', 0)} "
             f"extract_ok={stats['extract_ok']} extract_fail={stats['extract_fail']} dup_name={stats['dup_name']} "
             f"skip_non_product={stats['skip_non_product']} skip_zero_price={stats['skip_zero_price']} "
+            f"skip_foreign_domain={stats['skip_foreign_domain']} "
             f"duration_sec={_wall_sec:.1f} product_rows=0",
             flush=True,
         )
@@ -1387,6 +1497,7 @@ async def _run_scraper_async(
         f"rejected={stats['heuristic_rejected']} salla_fast={stats.get('salla_fast', 0)} "
         f"extract_ok={stats['extract_ok']} extract_fail={stats['extract_fail']} dup_name={stats['dup_name']} "
         f"skip_non_product={stats['skip_non_product']} skip_zero_price={stats['skip_zero_price']} "
+        f"skip_foreign_domain={stats['skip_foreign_domain']} "
         f"duration_sec={_wall_sec:.1f} product_rows={_nrows} products_per_min≈{_ppm:.1f}",
         flush=True,
     )
