@@ -4,15 +4,15 @@
   "success": false,
   "error": null,
   "scrape": {
-    "current": 1082,
-    "total": 5678,
-    "label": "🏪 متجر 1/18 | 🕸️ 1082/5678 | جاري البحث...",
-    "elapsed_sec": 4239,
-    "urls_per_min": 15.3,
+    "current": 167,
+    "total": 9994,
+    "label": "🏪 متجر 2/18 | 🕸️ 167/9994 | جاري البحث...",
+    "elapsed_sec": 1501,
+    "urls_per_min": 6.7,
     "products_per_min": 0.0
   },
   "analysis": {
-    "phase": "بدء",
+    "phase": "🕸️ جاري جلب الصفحات — لا صفوف منتج صالح بعد (سعر/تكرار/استخراج)",
     "progress_pct": 0.0,
     "ai_mode": "—",
     "counts": {
@@ -31,5 +31,5 @@
     "error": null,
     "pending_hydrate": false
   },
-  "updated_at": "2026-04-02T16:26:47.674629"
+  "updated_at": "2026-04-03T07:27:28.822626"
 }

@@ -1,12 +1,12 @@
 {
-  "active": false,
-  "phase": "idle",
-  "progress": 0.010586669797659582,
-  "message": "🏪 متجر 1/18 | 🕸️ 1082/5678 | جاري البحث...",
+  "active": true,
+  "phase": "scrape",
+  "progress": 0.056483890334200516,
+  "message": "🏪 متجر 2/18 | 🕸️ 167/9994 | جاري البحث...",
   "error": null,
   "job_id": null,
   "rows": 0,
-  "elapsed_sec": 4239,
-  "urls_per_min": 15.3,
+  "elapsed_sec": 1501,
+  "urls_per_min": 6.7,
   "products_per_min": 0.0
 }
