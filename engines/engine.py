@@ -357,17 +357,37 @@ def read_file(f):
             for enc in ['utf-8-sig','utf-8','windows-1256','cp1256','latin-1']:
                 try:
                     f.seek(0)
-                    df = pd.read_csv(f, encoding=enc, on_bad_lines='skip')
+                    # المسار السريع (C engine)؛ قد يفشل مع EOF inside string في ملفات سلة الكبيرة
+                    df = pd.read_csv(
+                        f,
+                        encoding=enc,
+                        on_bad_lines='skip',
+                    )
                     if len(df) > 0 and not df.columns[0].startswith('\ufeff'): 
                         break
                 except Exception:
-                    logger.warning(
-                        "read_file CSV parse step failed encoding=%s file=%s",
-                        enc,
-                        getattr(f, "name", "?"),
-                        exc_info=True,
-                    )
-                    continue
+                    # fallback متسامح: Python engine + اقتباس غير صارم لإصلاح
+                    # Error tokenizing data / EOF inside string
+                    try:
+                        f.seek(0)
+                        df = pd.read_csv(
+                            f,
+                            encoding=enc,
+                            on_bad_lines='skip',
+                            engine='python',
+                            sep=None,  # sniff delimiter تلقائياً
+                            quotechar='"',
+                        )
+                        if len(df) > 0:
+                            break
+                    except Exception:
+                        logger.warning(
+                            "read_file CSV parse step failed encoding=%s file=%s",
+                            enc,
+                            getattr(f, "name", "?"),
+                            exc_info=True,
+                        )
+                        continue
             if df is None:
                 return None, "فشل قراءة الملف بجميع الترميزات"
         elif name.endswith(('.xlsx','.xls')):
@@ -1229,7 +1249,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     4. مع مفاتيح: ≥AUTO_DECISION_CONFIDENCE (92) → تلقائي | MATCH_MIN_SCORE–91 → رؤية/Gemini
     """
     results = []
-    our_col       = _fcol(our_df, ["المنتج","اسم المنتج","Product","Name","name"])
+    our_col       = _fcol(our_df, ["المنتج","اسم المنتج","الاسم","Product","Name","name"])
     our_price_col = _fcol(our_df, ["سعر المنتج","السعر","سعر","Price","price","PRICE"])
     our_id_col    = _fcol(our_df, [
         "رقم المنتج","معرف المنتج","المعرف","معرف","رقم_المنتج","معرف_المنتج",
@@ -1246,7 +1266,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     # ── بناء الفهارس المسبقة ──
     indices = {}
     for cname, cdf in comp_dfs.items():
-        ccol = _fcol(cdf, ["المنتج","اسم المنتج","Product","Name","name"])
+        ccol = _fcol(cdf, ["المنتج","اسم المنتج","الاسم","Product","Name","name"])
         icol = _fcol(cdf, [
             "رقم المنتج","معرف المنتج","المعرف","معرف","رقم_المنتج","معرف_المنتج",
             "product_id","Product ID","Product_ID","ID","id","Id",
@@ -1506,7 +1526,7 @@ def find_missing_products(our_df, comp_dfs):
     ✅ حد ثقة مزدوج: موجود(82%) / مشابه(68%)
     ✅ منع التكرار من منافسين مختلفين
     """
-    our_col = _fcol(our_df, ["المنتج","اسم المنتج","Product","Name","name"])
+    our_col = _fcol(our_df, ["المنتج","اسم المنتج","الاسم","Product","Name","name"])
 
     # ── بناء فهرس منتجاتنا الكامل ─────────────────────────────────────
     our_items = []
@@ -1661,7 +1681,7 @@ def find_missing_products(our_df, comp_dfs):
     seen_bare = set()   # مفاتيح إزالة التكرار بين المنافسين
 
     for cname, cdf in comp_dfs.items():
-        ccol = _fcol(cdf, ["المنتج","اسم المنتج","Product","Name","name"])
+        ccol = _fcol(cdf, ["المنتج","اسم المنتج","الاسم","Product","Name","name"])
         icol = _fcol(cdf, [
             "رقم المنتج","معرف المنتج","المعرف","معرف","رقم_المنتج","معرف_المنتج",
             "product_id","Product ID","Product_ID","ID","id","Id",
@@ -1863,7 +1883,7 @@ def smart_missing_barrier(
 
     our_col = _fcol(
         our_df,
-        ["المنتج", "اسم المنتج", "Product", "Name", "name"],
+        ["المنتج", "اسم المنتج", "الاسم", "Product", "Name", "name"],
     )
     our_id_col = _fcol(
         our_df,
