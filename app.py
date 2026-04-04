@@ -30,6 +30,7 @@ from mahwous_logging import configure_logging
 configure_logging()
 
 import copy
+import gc
 import hashlib
 import tempfile
 from html import escape as _html_escape
@@ -38,7 +39,10 @@ import json
 import pickle
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_DATA_DIR = os.path.join(_APP_DIR, "data")
+_DATA_DIR = os.path.abspath(
+    os.path.expanduser((os.environ.get("MAHWOUS_DATA_DIR") or "/app/data").strip() or "/app/data")
+)
+os.makedirs(_DATA_DIR, exist_ok=True)
 _ANALYSIS_PAIR_COLS = frozenset({"المنتج", "منتج_المنافس"})
 import streamlit as st
 import pandas as pd
@@ -411,9 +415,10 @@ def _process_realtime_queue_main_thread():
                         if mask.any():
                             continue
                     
-                    # تقليم الذاكرة لمنع تضخم الجلسة وOOM
-                    capped = pd.concat([adf, res_df], ignore_index=True).tail(2000).copy()
+                    # تقليم الذاكرة لمنع تضخم الجلسة وOOM (Railway: 200 صف كحد أقصى للواجهة)
+                    capped = pd.concat([adf, res_df], ignore_index=True).tail(200).copy()
                     st.session_state.analysis_df = capped
+                    gc.collect()
                     r = _split_results(capped)
                     # الحفاظ على المفقودات الحالية
                     prev_r = st.session_state.get("results") or {}

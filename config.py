@@ -19,6 +19,14 @@ except ImportError:
 
 # جذر المشروع (مجلد config.py) — لا يعتمد على cwd عند streamlit run من مسار آخر
 _APP_ROOT = _os.path.dirname(_os.path.abspath(__file__))
+# بيانات دائمة — Railway Volume عند /app/data (أو MAHWOUS_DATA_DIR)
+_MAHWOUS_DATA = _os.path.abspath(
+    _os.path.expanduser((_os.environ.get("MAHWOUS_DATA_DIR") or "/app/data").strip() or "/app/data")
+)
+try:
+    _os.makedirs(_MAHWOUS_DATA, exist_ok=True)
+except OSError as e:
+    _log.warning("could not mkdir MAHWOUS_DATA_DIR: %s", e, exc_info=True)
 
 # ===== معلومات التطبيق =====
 APP_TITLE   = "نظام التسعير الذكي - مهووس"
@@ -192,8 +200,8 @@ def get_apify_competitor_label() -> str:
 
 
 def apify_auto_import_state_path() -> str:
-    """ملف حالة آخر استيراد (داخل data/)."""
-    d = _os.path.join(_APP_ROOT, "data")
+    """ملف حالة آخر استيراد (داخل MAHWOUS_DATA_DIR)."""
+    d = _MAHWOUS_DATA
     try:
         _os.makedirs(d, exist_ok=True)
     except OSError as e:
@@ -420,7 +428,7 @@ PAGES_PER_TABLE  = 25
 DB_PATH = _os.path.join(tempfile.gettempdir(), "pricing_v18.db")
 
 # قائمة المنافسين الافتراضية للكشط — يُحمَّل من الملف؛ يمكن تعديل JSON دون المساس بالكود
-PRESET_COMPETITORS_PATH = _os.path.join(_APP_ROOT, "data", "preset_competitors.json")
+PRESET_COMPETITORS_PATH = _os.path.join(_MAHWOUS_DATA, "preset_competitors.json")
 # إن فُقد الملف على السيرفر (Docker/Volume) تُستخدم هذه القائمة — نفس محتوى data/preset_competitors.json
 PRESET_COMPETITORS_FALLBACK: list[dict] = [
     {"name": "سعيد صلاح", "store_url": "https://saeedsalah.com/", "sitemap_url": "https://saeedsalah.com/sitemap.xml"},
