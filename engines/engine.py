@@ -207,9 +207,13 @@ def _fuzzy_correct_brand(text: str, threshold: int = 82) -> str:
 
 # ─── SQLite Cache ───────────────────────────
 # خيوط متعددة (كشط + تحليل) تضرب نفس الملف؛ WAL + قفل + timeout يمنعون database is locked
-# مسار ثابت تحت data/ حتى لا يُفقد الكاش عند إعادة تشغيل الحاوية (عكس tempfile)
+# مسار ثابت — Railway Volume عند MAHWOUS_DATA_DIR (افتراضي /app/data)
 _BASE_DIR = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-_DATA_DIR_CACHE = _os.path.join(_BASE_DIR, "data")
+_DATA_DIR_CACHE = _os.path.abspath(
+    _os.path.expanduser(
+        ((_os.environ.get("MAHWOUS_DATA_DIR") or "/app/data").strip() or "/app/data")
+    )
+)
 _os.makedirs(_DATA_DIR_CACHE, exist_ok=True)
 _DB = _os.path.join(_DATA_DIR_CACHE, "match_cache_v26.db")
 _CACHE_LOCK = threading.Lock()

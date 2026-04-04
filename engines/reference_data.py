@@ -14,12 +14,8 @@ from rapidfuzz import fuzz, process as rf_process
 
 logger = logging.getLogger(__name__)
 
-_BASE_DIR = pathlib.Path(__file__).resolve().parent.parent
-_data_override = (os.environ.get("MAHWOUS_DATA_DIR") or "").strip()
-if _data_override:
-    DATA_DIR = pathlib.Path(_data_override).expanduser().resolve()
-else:
-    DATA_DIR = _BASE_DIR / "data"
+_DATA_DIR = (os.environ.get("MAHWOUS_DATA_DIR") or "/app/data").strip() or "/app/data"
+DATA_DIR = pathlib.Path(_DATA_DIR).expanduser().resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 BRANDS_CSV = str(DATA_DIR / "brands.csv")
