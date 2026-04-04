@@ -82,7 +82,7 @@ def _extract_from_json_ld(html: str, page_url: str | None = None) -> dict[str, A
     out: dict[str, Any] = {}
     fallback_img: str | None = None
     for m in re.finditer(
-        r'<script[^>]+type=["\\]'application/ld\\+json["\\]'[^>]*>(.*?)</script>',
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html,
         re.I | re.DOTALL,
     ):
@@ -155,19 +155,19 @@ def _extract_from_json_ld(html: str, page_url: str | None = None) -> dict[str, A
 def _extract_meta_fallback(html: str, page_url: str | None = None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     m = re.search(
-        r'<meta\\s+property=[\"\\]'og:title[\"\\]'\\s+content=[\"\\]'([^\"\\]+)["\\]']',
+        r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
         html,
         re.I,
     )
     if m:
         out["name"] = unescape(m.group(1))
     for pat in (
-        r'<meta\\s+property=[\"\\]'og:image[\"\\]'\\s+content=[\"\\]'([^\"\\]+)["\\]']',
-        r'<meta\\s+content=[\"\\]'([^\"\\]+)["\\]'\\s+property=[\"\\]'og:image[\"\\]']',
-        r'<meta\\s+property=[\"\\]'og:image:secure_url[\"\\]'\\s+content=[\"\\]'([^\"\\]+)["\\]']',
-        r'<meta\\s+content=[\"\\]'([^\"\\]+)["\\]'\\s+property=[\"\\]'og:image:secure_url[\"\\]']',
-        r'<meta\\s+name=[\"\\]'twitter:image[\"\\]'\\s+content=[\"\\]'([^\"\\]+)["\\]']',
-        r'<meta\\s+name=[\"\\]'twitter:image:src[\"\\]'\\s+content=[\"\\]'([^\"\\]+)["\\]']',
+        r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+        r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+        r'<meta\s+property=["\']og:image:secure_url["\']\s+content=["\']([^"\']+)["\']',
+        r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image:secure_url["\']',
+        r'<meta\s+name=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
+        r'<meta\s+name=["\']twitter:image:src["\']\s+content=["\']([^"\']+)["\']',
     ):
         m = re.search(pat, html, re.I)
         if m:
@@ -175,16 +175,16 @@ def _extract_meta_fallback(html: str, page_url: str | None = None) -> dict[str, 
             break
     if not out.get("image"):
         m = re.search(
-            r'<link[^>]+rel=[\"\\]'image_src[\"\\]'[^^>]+href=[\"\\]'([^\"\\]+)["\\]']',
+            r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']',
             html,
             re.I,
         )
         if m:
             out["image"] = m.group(1).strip()
     for pat in (
-        r'"price"\\s*:\\s*([\\d.]+)',
-        r'itemprop=[\"\\]'price[\"\\]'\\s+content=[\"\\]'([\\d.]+)["\\]']',
-        r'data-price=[\"\\]'([\\d.]+)["\\]']',
+        r'"price"\s*:\s*([\d.]+)',
+        r'itemprop=["\']price["\']\s+content=["\']([\d.]+)["\']',
+        r'data-price=["\']([\d.]+)["\']',
     ):
         m = re.search(pat, html, re.I)
         if m:
@@ -357,9 +357,15 @@ async def _expand_sitemap_to_page_urls_async(
             continue
         locs, is_index = _parse_sitemap_xml(raw)
         if is_index:
+            q_set = set(q)
             for loc in locs:
-                if loc.startswith("http") and loc not in seen_sm:
+                if (
+                    loc.startswith("http")
+                    and loc not in seen_sm
+                    and loc not in q_set
+                ):
                     q.append(loc)
+                    q_set.add(loc)
         else:
             for loc in locs:
                 if loc.startswith("http"):
