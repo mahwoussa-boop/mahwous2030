@@ -25,6 +25,7 @@ from urllib.parse import urljoin, urlparse
 
 from browser_like_http import AsyncScraperHTTP
 from utils.jsonfast import dump as json_dump, load as json_load, loads as json_loads
+from config import _MAHWOUS_DATA
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,22 @@ try:
         import uvloop  # noqa: F401 — اختياري، يُستورد للتحقق من التثبيت
 except ImportError:
     logger.debug("uvloop not installed or unavailable; using default asyncio loop", exc_info=True)
+
+# 1. Absolute reliance on config.py for paths
+DATA_DIR = _MAHWOUS_DATA
+os.makedirs(DATA_DIR, exist_ok=True)
+LIST_PATH = os.path.join(DATA_DIR, "competitors_list.json")
+OUT_CSV = os.path.join(DATA_DIR, "competitors_latest.csv")
+_COMP_CSV_FIELDS = ["اسم المنتج", "السعر", "رقم المنتج", "رابط_الصورة"]
+SCRAPER_BG_STATE_PATH = os.path.join(DATA_DIR, "scraper_bg_state.json")
+CHECKPOINT_JSON = os.path.join(DATA_DIR, "scraper_checkpoint.json")
+CHECKPOINT_CSV = os.path.join(DATA_DIR, "competitors_checkpoint.csv")
+
+# 2. Strict Concurrency Control (OOM Prevention)
+_MAX_CONCURRENT_FETCH = int(os.environ.get("SCRAPER_MAX_CONCURRENT_FETCH", 3))
+if _MAX_CONCURRENT_FETCH > 5:
+    logger.warning("Concurrency too high for safe memory limits. Capping at 3.")
+    _MAX_CONCURRENT_FETCH = 3
 
 
 def _is_ld_product_group_node(node: dict) -> bool:
@@ -65,18 +82,6 @@ def _is_ld_product_node(node: dict) -> bool:
         if str(p).strip().lower() == "product":
             return True
     return False
-
-
-_SCRAPER_ROOT = os.path.dirname(os.path.abspath(__file__))
-_DATA_ROOT = (os.environ.get("MAHWOUS_DATA_DIR") or "/app/data").strip() or "/app/data"
-DATA_DIR = os.path.abspath(os.path.expanduser(_DATA_ROOT))
-os.makedirs(DATA_DIR, exist_ok=True)
-LIST_PATH = os.path.join(DATA_DIR, "competitors_list.json")
-OUT_CSV = os.path.join(DATA_DIR, "competitors_latest.csv")
-_COMP_CSV_FIELDS = ["اسم المنتج", "السعر", "رقم المنتج", "رابط_الصورة"]
-SCRAPER_BG_STATE_PATH = os.path.join(DATA_DIR, "scraper_bg_state.json")
-CHECKPOINT_JSON = os.path.join(DATA_DIR, "scraper_checkpoint.json")
-CHECKPOINT_CSV = os.path.join(DATA_DIR, "competitors_checkpoint.csv")
 
 
 def _rows_snapshot_shallow(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -116,8 +121,6 @@ if _SITEMAP_EXPAND_TIMEOUT_SEC <= 0:
     _SITEMAP_EXPAND_TIMEOUT_SEC = 600
 _CHECKPOINT_EVERY = _env_int("SCRAPER_CHECKPOINT_EVERY", 100)
 _CLEAR_CK = os.environ.get("SCRAPER_CLEAR_CHECKPOINT", "").strip() in ("1", "true", "yes")
-# Railway OOM: لا تتجاوز 3 مهام متزامنة (متصفحات ~150MB لكل منها)
-_MAX_CONCURRENT_FETCH = max(1, min(3, _env_int("SCRAPER_MAX_CONCURRENT_FETCH", 3)))
 _HEURISTIC_MODE = (os.environ.get("SCRAPER_HEURISTIC_MODE", "loose") or "loose").strip().lower()
 try:
     _PIPELINE_EVERY = max(0, int(os.environ.get("SCRAPER_PIPELINE_EVERY", "3") or "3"))
