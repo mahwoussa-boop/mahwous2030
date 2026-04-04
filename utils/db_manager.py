@@ -1054,28 +1054,30 @@ def reset_application_session_storage(
                     exc_info=True,
                 )
 
-    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _data_vol = os.path.abspath(
+        os.path.expanduser((os.environ.get("MAHWOUS_DATA_DIR") or "/app/data").strip() or "/app/data")
+    )
     candidates = [
-        os.path.join(_ROOT, "data", "live_session_results.pkl"),
-        os.path.join(_ROOT, "data", "live_session_results.pkl.tmp"),
-        os.path.join(_ROOT, "data", "scrape_live_snapshot.json"),
-        os.path.join(_ROOT, "data", "scrape_bg_context.pkl"),
+        os.path.join(_data_vol, "live_session_results.pkl"),
+        os.path.join(_data_vol, "live_session_results.pkl.tmp"),
+        os.path.join(_data_vol, "scrape_live_snapshot.json"),
+        os.path.join(_data_vol, "scrape_bg_context.pkl"),
     ]
     if clear_scraper_state:
         candidates.extend(
             [
-                os.path.join(_ROOT, "data", "scraper_bg_state.json"),
-                os.path.join(_ROOT, "data", "scraper_checkpoint.json"),
-                os.path.join(_ROOT, "data", "competitors_checkpoint.csv"),
-                os.path.join(_ROOT, "data", "scraper_progress.json"),
-                os.path.join(_ROOT, "data", "scraper_last_run.json"),
+                os.path.join(_data_vol, "scraper_bg_state.json"),
+                os.path.join(_data_vol, "scraper_checkpoint.json"),
+                os.path.join(_data_vol, "competitors_checkpoint.csv"),
+                os.path.join(_data_vol, "scraper_progress.json"),
+                os.path.join(_data_vol, "scraper_last_run.json"),
             ]
         )
     if clear_match_cache_file:
         candidates.extend(
             [
-                os.path.join(_ROOT, "data", "match_cache_v26.db"),
-                os.path.join(_ROOT, "match_cache_v21.db"),
+                os.path.join(_data_vol, "match_cache_v26.db"),
+                os.path.join(_data_vol, "match_cache_v21.db"),
                 os.path.join(tempfile.gettempdir(), "match_cache_v21.db"),
             ]
         )
