@@ -76,6 +76,9 @@ from config import (
     PRESET_COMPETITORS_PATH,
     PRICE_DIFF_THRESHOLD,
     SECTIONS,
+    get_apify_auto_import,
+    get_apify_default_actor_id,
+    get_apify_token,
     get_cohere_api_key,
     get_gemini_api_keys,
     get_openrouter_api_key,
@@ -507,6 +510,7 @@ def _infer_api_diag_summary(diag: dict) -> dict:
         out["cohere"] = _classify_provider_line(diag.get("cohere", ""))
     out["wh_price"] = "ok" if get_webhook_update_prices() else "absent"
     out["wh_new"] = "ok" if get_webhook_missing_products() else "absent"
+    out["apify"] = "ok" if get_apify_token() else "absent"
     return out
 
 
@@ -518,6 +522,7 @@ def _presence_api_summary() -> dict:
         "cohere": "ok" if get_cohere_api_key() else "absent",
         "wh_price": "ok" if get_webhook_update_prices() else "absent",
         "wh_new": "ok" if get_webhook_missing_products() else "absent",
+        "apify": "ok" if get_apify_token() else "absent",
     }
 
 
@@ -537,6 +542,7 @@ def _api_badges_html() -> str:
         ("🔀", "OpenRouter", m.get("openrouter", "unknown")),
         ("◎", "Cohere", m.get("cohere", "unknown")),
         ("🔗", "Make", wh_st),
+        ("🎭", "Apify", m.get("apify", "unknown")),
     ]
     chips = []
     for icon, label, stt in items:
@@ -2735,6 +2741,13 @@ with st.sidebar:
     )
     st.markdown(_api_badges_html(), unsafe_allow_html=True)
 
+    try:
+        from utils.apify_sync import try_apify_auto_import_sidebar
+
+        try_apify_auto_import_sidebar()
+    except Exception:
+        pass
+
     # زر تشخيص سريع
     if not ai_ok:
         if st.button("🔍 تشخيص المشكلة", key="diag_btn"):
@@ -4890,10 +4903,131 @@ elif page == "⚙️ الإعدادات":
             _settings_api_card_html("Make.com (Webhooks)", "🔗", _wh),
             unsafe_allow_html=True,
         )
+        _apfy = "ok" if get_apify_token() else "absent"
+        st.markdown(
+            _settings_api_card_html("Apify (ممثل الكشط)", "🎭", _apfy),
+            unsafe_allow_html=True,
+        )
         st.caption(
             "بعد «تشخيص شامل» تظهر هنا **فاتورة/رصيد منتهٍ (402)** و**تجاوز حد (429)** بألوان مميزة. "
             "بدون تشخيص: يُعرض وجود المفتاح فقط."
         )
+
+        with st.expander("🎭 Apify — مفتاح وجلب النتائج (لا تلصق الرمز في الدردشة)", expanded=False):
+            st.markdown(
+                "1. أنشئ رمز API من [لوحة Apify → Integrations](https://console.apify.com/account/integrations). أضف **`APIFY_TOKEN`**.  \n"
+                "2. أضف **`APIFY_DEFAULT_ACTOR_ID`** مثل `immaculate_piccolo~my-actor`.  \n"
+                "3. **تلقائي:** عند وجود الرمز والممثل معاً، يستورد التطبيق **آخر تشغيل ناجح** إلى قاعدة **كتالوج المنافسين** كل ~90 ثانية مع إشعار.  \n"
+                "4. عطّل المزامنة التلقائية: `APIFY_AUTO_IMPORT=0`. اسم المجموعة: `APIFY_COMPETITOR_LABEL` (افتراضي: Apify)."
+            )
+            st.caption(
+                "تحميل يدوي من Dataset لا يزال متاحاً أدناه. لا تنشر روابط تحوي `token=`."
+            )
+            if get_apify_token() and get_apify_default_actor_id() and get_apify_auto_import():
+                st.success("✅ مزامنة Apify التلقائية مفعّلة (آخر تشغيل ناجح → المنافس في التحليل).")
+            elif get_apify_token() and get_apify_default_actor_id():
+                st.info("ℹ️ المزامنة التلقائية معطّلة (`APIFY_AUTO_IMPORT=0`) — يمكنك الاستيراد بالزر أدناه.")
+            if st.button("🔄 دمج آخر تشغيل ناجح مع قاعدة المنافسين الآن", key="btn_apify_sync_db"):
+                from utils.apify_sync import sync_apify_catalog_from_cloud
+                with st.spinner("جلب آخر تشغيل ودمج البيانات…"):
+                    _sync_r = sync_apify_catalog_from_cloud(force=True)
+                if _sync_r.get("ok"):
+                    st.success(
+                        f"✅ دُمج {_sync_r.get('rows')} صفًا — التشغيل `{_sync_r.get('run_id', '')[:16]}…`"
+                    )
+                elif _sync_r.get("reason") == "already_imported":
+                    st.warning("لا جديد: هذا التشغيل مُستورد مسبقاً. نفّذ تشغيلاً جديداً على Apify ثم أعد المحاولة.")
+                elif _sync_r.get("error"):
+                    st.error(_sync_r["error"])
+                else:
+                    st.warning(_sync_r.get("reason") or "تخطّي — تحقق من وجود تشغيل ناجح على الممثل.")
+            if st.button("اختبار الاتصال بـ Apify", key="btn_apify_ping"):
+                from utils.apify_helper import validate_token
+                _ok, _msg = validate_token(get_apify_token())
+                (st.success if _ok else st.error)(f"{'✅' if _ok else '❌'} {_msg}")
+            _run_id_in = st.text_input(
+                "Run ID (اختياري — لملء dataset تلقائياً)",
+                placeholder="مثال: Gs979n1Nafso9Gb01",
+                key="apify_settings_run_id",
+            )
+            _ds_in = st.text_input(
+                "Dataset ID (أو اتركه فارغاً إذا ملأت Run ID)",
+                placeholder="من تبويب Storage في نفس التشغيل",
+                key="apify_settings_dataset_id",
+            )
+            if st.button("جلب عناصر الـ dataset", key="btn_apify_fetch_items"):
+                from utils.apify_helper import fetch_dataset_items, get_actor_run
+                _tok = get_apify_token()
+                if not _tok:
+                    st.error("لم يُعثر على APIFY_TOKEN في البيئة / Secrets.")
+                else:
+                    _ds = (_ds_in or "").strip()
+                    _rid = (_run_id_in or "").strip()
+                    try:
+                        if not _ds and _rid:
+                            with st.spinner("جاري قراءة التشغيل..."):
+                                _info = get_actor_run(_tok, _rid)
+                            _ds = str((_info or {}).get("defaultDatasetId") or "").strip()
+                            if not _ds:
+                                st.error("التشغيل لا يحتوي defaultDatasetId — الصق Dataset ID يدوياً.")
+                            else:
+                                st.caption(f"تم استخدام dataset: `{_ds}`")
+                        if _ds:
+                            with st.spinner("جاري التحميل..."):
+                                _items = fetch_dataset_items(_tok, _ds, limit=5000)
+                            st.success(f"تم جلب {len(_items)} عنصراً.")
+                            if _items:
+                                try:
+                                    st.dataframe(pd.json_normalize(_items), use_container_width=True)
+                                except Exception:
+                                    st.json(_items[:50])
+                                st.download_button(
+                                    "تنزيل JSON",
+                                    data=json.dumps(_items, ensure_ascii=False, indent=2),
+                                    file_name=f"apify_dataset_{_ds[:12]}.json",
+                                    mime="application/json",
+                                    key="dl_apify_dataset_json",
+                                )
+                    except Exception as e:
+                        st.error(str(e)[:400])
+
+            st.markdown("**تشغيل الممثل (متقدم)** — يلزم أن تعرف شكل **input** JSON الخاص بممثلك.")
+            _actor_f = st.text_input(
+                "Actor ID",
+                value=get_apify_default_actor_id() or "",
+                placeholder="immaculate_piccolo~my-actor",
+                key="apify_settings_actor_id",
+            )
+            _input_json = st.text_area(
+                "INPUT (JSON)",
+                value='{\n  "startUrls": [{"url": "https://example.com/product"}]\n}',
+                height=120,
+                key="apify_settings_input_json",
+            )
+            if st.button("بدء تشغيل الآن", key="btn_apify_start_run"):
+                from utils.apify_helper import start_actor_run
+                _tok = get_apify_token()
+                _aid = (_actor_f or "").strip().replace("/", "~")
+                if not _tok:
+                    st.error("APIFY_TOKEN غير مضبوط.")
+                elif not _aid:
+                    st.error("أدخل Actor ID.")
+                else:
+                    try:
+                        _inp = json.loads(_input_json or "{}")
+                        if not isinstance(_inp, dict):
+                            raise ValueError("INPUT يجب أن يكون كائناً JSON")
+                        with st.spinner("جاري بدء التشغيل..."):
+                            _run = start_actor_run(_tok, _aid, _inp)
+                        _new_id = str((_run or {}).get("id") or "")
+                        st.success("تم بدء التشغيل.")
+                        st.json(_run or {})
+                        if _new_id:
+                            st.info(f"يمكنك متابعة Run ID في Apify: `{_new_id}`")
+                    except json.JSONDecodeError:
+                        st.error("JSON غير صالح في حقل INPUT.")
+                    except Exception as e:
+                        st.error(str(e)[:400])
 
         with st.expander("🔗 ربط Make.com — لصق روابط الـ Webhook (ليس رابط المشاركة العامة)", expanded=False):
             st.markdown(
