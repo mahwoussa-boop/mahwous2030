@@ -12,10 +12,23 @@ utils/make_helper.py v24.0 — إرسال صحيح لـ Make.com
 
 import requests
 import json
+import logging
+import math
 import os
 import time
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore
+try:
+    import pandas as pd
+except ImportError:
+    pd = None  # type: ignore
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 MAX_DESC = 50_000
 
@@ -32,7 +45,7 @@ def _webhook_missing_url() -> str:
         return u
     return (os.environ.get("WEBHOOK_NEW_PRODUCTS") or "").strip()
 
-TIMEOUT = 15  # ثانية
+TIMEOUT = 10  # مهلة طلبات webhook — JSON نظيف + عدم تجميد الواجهة
 
 
 def _webhook_url_allowed(url: str) -> bool:
@@ -50,6 +63,25 @@ def _webhook_url_allowed(url: str) -> bool:
     if not any(c.isalpha() or c.isdigit() for c in host):
         return False
     return True
+
+
+def _sanitize_json_payload(payload: Any) -> Any:
+    """يستبدل NaN/Inf بعدم JSON صالح (None) قبل requests.post(json=...)."""
+    if pd is not None and isinstance(payload, pd.DataFrame):
+        df = payload
+        if np is not None:
+            df = df.replace({np.nan: None})
+        else:
+            df = df.astype(object).where(pd.notna(df), None)
+        return df.to_dict(orient="records")
+    if isinstance(payload, dict):
+        return {k: _sanitize_json_payload(v) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_sanitize_json_payload(x) for x in payload]
+    if isinstance(payload, float):
+        if math.isnan(payload) or math.isinf(payload):
+            return None
+    return payload
 
 
 def _clip_desc_field(s: str) -> str:
@@ -74,10 +106,11 @@ def _post_to_webhook(url: str, payload: Any) -> Dict:
             "status_code": 0,
         }
     try:
+        clean = _sanitize_json_payload(payload)
         headers = {"Content-Type": "application/json"}
         resp = requests.post(
             url,
-            json=payload,
+            json=clean,
             headers=headers,
             timeout=TIMEOUT
         )
@@ -102,11 +135,14 @@ def _post_to_webhook(url: str, payload: Any) -> Dict:
 
 # ── تحويل float آمن ───────────────────────────────────────────────────────
 def _safe_float(val, default: float = 0.0) -> float:
-    """تحويل آمن إلى float"""
+    """تحويل آمن إلى float مع تنظيف قيم NaN/Inf المسببة لانهيار JSON Make"""
     try:
-        if val is None or str(val).strip() in ("", "nan", "None", "NaN"):
+        if val is None or str(val).strip() in ("", "nan", "None", "NaN", "<NA>"):
             return default
-        return float(val)
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
     except (ValueError, TypeError):
         return default
 
@@ -434,7 +470,7 @@ def send_missing_products(products: List[Dict]) -> Dict:
 #  إرسال بدفعات ذكية مع retry و progress callback
 # ══════════════════════════════════════════════════════════════════════
 def send_batch_smart(products: list, batch_type: str = "update",
-                     batch_size: int = 20, max_retries: int = 3,
+                     batch_size: int = 20, max_retries: int = 1,
                      progress_cb=None, confidence_filter: str = "") -> Dict:
     """
     إرسال بدفعات ذكية مع retry تلقائي و progress callback.
@@ -493,8 +529,8 @@ def send_batch_smart(products: list, batch_type: str = "update",
             try:
                 progress_cb(sent_count, fail_count, total,
                            batch[-1].get("name", "")[:30] if batch else "")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Make webhook progress_cb failed: %s", e, exc_info=True)
 
         # تأخير بين الدفعات
         if i + batch_size < total:

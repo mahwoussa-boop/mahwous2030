@@ -7,10 +7,13 @@
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 _RE_MULTI_SPACE = re.compile(r"\s+")
 _RE_META_OG = re.compile(
@@ -52,8 +55,8 @@ def standardize_product_name(
             if v > 0:
                 suf = f"{int(v)}ml" if v == int(v) else f"{v}ml"
                 return f"{base} {suf}".strip() if base else suf
-        except ValueError:
-            pass
+        except ValueError as e:
+            logger.debug("standardize_product_name size parse failed raw=%r: %s", raw, e, exc_info=True)
     return f"{base} {size_ml}".strip() if base else str(size_ml)
 
 
@@ -114,8 +117,8 @@ def ai_enrich_product_row(row: Dict[str, Any], use_ai: bool) -> Dict[str, Any]:
     try:
         row = dict(row)
         row["_fragrantica_cache"] = fetch_fragrantica_info(name)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_fragrantica_info failed for quick_add: %s", e, exc_info=True)
     return row
 
 

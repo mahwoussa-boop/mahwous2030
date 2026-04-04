@@ -4,6 +4,7 @@ Weighted Threat Index (WTI) — ترتيب المنافسين حسب خطر ال
 """
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, List, Mapping, MutableMapping, Optional, Union
@@ -45,8 +46,8 @@ def parse_last_seen(
         return fb
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        pass
+    except ValueError as e:
+        _log.debug("parse_last_seen isoformat failed raw=%r: %s", s[:80], e, exc_info=True)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(s[:19], fmt)
@@ -105,12 +106,16 @@ def rank_competitors_for_ui(
     if not competitors_list:
         return competitors_list
 
-    if our_price is None or float(our_price) <= 0:
+    try:
+        our_p = float(our_price) if our_price is not None else 0.0
+    except (ValueError, TypeError):
+        our_p = 0.0
+
+    if our_p <= 0:
         for c in competitors_list:
             c["threat_score"] = 0.0
+            c["normalized_threat"] = 0.0
         return competitors_list
-
-    our_p = float(our_price)
     anchor = now or datetime.now()
     if anchor.tzinfo is not None:
         anchor = anchor.replace(tzinfo=None)
@@ -136,6 +141,19 @@ def rank_competitors_for_ui(
 
         base = (weight_price * price_factor) + (weight_confidence * conf)
         comp["threat_score"] = round(base * freshness * 100.0, 2)
+
+    scores = [float(x.get("threat_score", 0) or 0) for x in competitors_list]
+    if scores:
+        min_score = min(scores)
+        max_score = max(scores)
+        denominator = max_score - min_score
+        if denominator <= 0:
+            for c in competitors_list:
+                c["normalized_threat"] = float(c.get("threat_score", 0) or 0)
+        else:
+            for c in competitors_list:
+                ts = float(c.get("threat_score", 0) or 0)
+                c["normalized_threat"] = round((ts - min_score) / denominator, 4)
 
     return sorted(competitors_list, key=lambda x: float(x.get("threat_score", 0) or 0), reverse=True)
 

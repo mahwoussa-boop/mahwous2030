@@ -5,12 +5,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import requests
 
 APIFY_V2 = "https://api.apify.com/v2"
 TIMEOUT = 60
+_STARTURLS_MAX_PER_PAYLOAD = 2000
+
+logger = logging.getLogger(__name__)
 
 
 def validate_token(token: str) -> tuple[bool, str]:
@@ -79,7 +83,7 @@ def fetch_dataset_items(
     token: str,
     dataset_id: str,
     *,
-    limit: int = 10_000,
+    limit: int = 1000,
     offset: int = 0,
     clean: bool = True,
 ) -> list[dict[str, Any]]:
@@ -103,17 +107,13 @@ def fetch_dataset_items(
     return [x for x in out if isinstance(x, dict)]
 
 
-def start_actor_run(
+def _post_single_actor_run(
     token: str,
     actor_id: str,
     run_input: dict[str, Any],
     *,
     memory_mbytes: int | None = None,
 ) -> dict[str, Any]:
-    """
-    يبدأ تشغيل ممثل. actor_id بالصيغة username~actorName.
-    run_input يُرسل كجسم JSON (INPUT في Apify).
-    """
     t = (token or "").strip()
     aid = (actor_id or "").strip().replace("/", "~")
     if not t or not aid:
@@ -132,3 +132,38 @@ def start_actor_run(
     r.raise_for_status()
     data = r.json()
     return data.get("data") if isinstance(data, dict) else data
+
+
+def start_actor_run(
+    token: str,
+    actor_id: str,
+    run_input: dict[str, Any],
+    *,
+    memory_mbytes: int | None = None,
+) -> dict[str, Any]:
+    """
+    يبدأ تشغيل ممثل. actor_id بالصيغة username~actorName.
+    run_input يُرسل كجسم JSON (INPUT في Apify).
+    قوائم startUrls الطويلة تُجزّأ لتفادي HTTP 413 (Payload Too Large).
+    """
+    ri = dict(run_input or {})
+    urls = ri.get("startUrls")
+    if isinstance(urls, list) and len(urls) > _STARTURLS_MAX_PER_PAYLOAD:
+        last: dict[str, Any] | None = None
+        n = len(urls)
+        for i in range(0, n, _STARTURLS_MAX_PER_PAYLOAD):
+            chunk = dict(ri)
+            chunk["startUrls"] = urls[i : i + _STARTURLS_MAX_PER_PAYLOAD]
+            logger.info(
+                "Apify startUrls chunk %s–%s of %s",
+                i,
+                min(i + _STARTURLS_MAX_PER_PAYLOAD, n) - 1,
+                n,
+            )
+            last = _post_single_actor_run(
+                token, actor_id, chunk, memory_mbytes=memory_mbytes
+            )
+        return last if last is not None else {}
+    return _post_single_actor_run(
+        token, actor_id, ri, memory_mbytes=memory_mbytes
+    )

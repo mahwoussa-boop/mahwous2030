@@ -8,10 +8,14 @@ utils/db_manager.py - v18.0
 مسار قاعدة البيانات (DB_PATH) — يطابق config.DB_PATH (نفس الملف؛ يُعرّف هنا لتجنب circular import).
 """
 import hashlib
+import logging
 import os
 import sqlite3
 import tempfile
 from datetime import datetime
+from typing import Optional
+
+_db_logger = logging.getLogger(__name__)
 
 from utils.jsonfast import dumps as json_dumps, loads as json_loads
 
@@ -20,12 +24,25 @@ _DB_NAME = "pricing_v18.db"
 DB_PATH = os.path.join(tempfile.gettempdir(), _DB_NAME)
 
 
+def get_connection(db_path: Optional[str] = None):
+    """
+    اتصال SQLite مع WAL — يقلّل أخطاء «database is locked» مع خيوط متعددة.
+    """
+    path = db_path or DB_PATH
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
+
+
 def _log_db_err(where: str, err: Exception) -> None:
     """تسجيل أخطاء المسارات الحرجة — لا يُبتلع الخطأ بصمت."""
+    _db_logger.error("db_manager.%s: %s", where, err, exc_info=True)
     try:
         print(f"[ERROR] db_manager.{where}: {err}", flush=True)
     except Exception:
-        pass
+        _db_logger.debug("db_manager._log_db_err print failed where=%s", where, exc_info=True)
 
 
 def _sqlite_like_escape(s: str) -> str:
@@ -42,19 +59,18 @@ def _date():
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-    # WAL: يسمح بالقراءة والكتابة المتزامنة من threads مختلفة بدون تعارض
-    conn.execute("PRAGMA journal_mode=WAL;")
+    conn = get_connection(DB_PATH)
+    # مزامنة ومهلات إضافية بعد وضع WAL في get_connection
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")  # 30 ثانية انتظار بدل الخطأ الفوري
     try:
         conn.execute("PRAGMA mmap_size=30000000000;")
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as e:
+        _db_logger.debug("PRAGMA mmap_size skipped: %s", e)
     try:
         conn.execute("PRAGMA cache_size=-2000;")
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as e:
+        _db_logger.debug("PRAGMA cache_size skipped: %s", e)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -574,8 +590,8 @@ def upsert_our_catalog(our_df, name_col="اسم المنتج", id_col="رقم ا
         _log_db_err("upsert_our_catalog", e)
         try:
             conn.rollback()
-        except Exception:
-            pass
+        except Exception as rb:
+            _log_db_err("upsert_our_catalog.rollback", rb)
         raise
     finally:
         try:
@@ -698,8 +714,8 @@ ON CONFLICT(competitor, comp_product_key) DO UPDATE SET
         _log_db_err("upsert_comp_catalog", e)
         try:
             conn.rollback()
-        except Exception:
-            pass
+        except Exception as rb:
+            _log_db_err("upsert_comp_catalog.rollback", rb)
         raise
     finally:
         try:
@@ -824,7 +840,7 @@ def get_processed(limit=200) -> list:
             try:
                 conn.close()
             except Exception:
-                pass
+                _db_logger.error("db_manager: conn.close failed after get_processed", exc_info=True)
 
 
 def undo_processed(product_key: str) -> bool:
@@ -845,7 +861,7 @@ def undo_processed(product_key: str) -> bool:
             try:
                 conn.close()
             except Exception:
-                pass
+                _db_logger.error("db_manager: conn.close failed after undo_processed", exc_info=True)
 
 
 def get_processed_keys() -> set:
@@ -863,7 +879,7 @@ def get_processed_keys() -> set:
             try:
                 conn.close()
             except Exception:
-                pass
+                _db_logger.error("db_manager: conn.close failed after get_processed_keys", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -997,7 +1013,7 @@ def migrate_db_v26():
             try:
                 conn.close()
             except Exception:
-                pass
+                _db_logger.error("db_manager: conn.close failed after migrate_db_v26", exc_info=True)
 
 
 def reset_application_session_storage(
@@ -1033,7 +1049,10 @@ def reset_application_session_storage(
             try:
                 conn.close()
             except Exception:
-                pass
+                _db_logger.error(
+                    "db_manager: conn.close failed after reset_application_session_storage",
+                    exc_info=True,
+                )
 
     _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     candidates = [
@@ -1053,7 +1072,13 @@ def reset_application_session_storage(
             ]
         )
     if clear_match_cache_file:
-        candidates.append(os.path.join(_ROOT, "match_cache_v21.db"))
+        candidates.extend(
+            [
+                os.path.join(_ROOT, "data", "match_cache_v26.db"),
+                os.path.join(_ROOT, "match_cache_v21.db"),
+                os.path.join(tempfile.gettempdir(), "match_cache_v21.db"),
+            ]
+        )
 
     for p in candidates:
         try:
@@ -1112,12 +1137,16 @@ def clear_app_persistent_logs(
             try:
                 conn.rollback()
             except Exception:
-                pass
+                _db_logger.error(
+                    "db_manager: rollback failed after clear_app_persistent_logs", exc_info=True
+                )
     finally:
         if conn is not None:
             try:
                 conn.close()
             except Exception:
-                pass
+                _db_logger.error(
+                    "db_manager: conn.close failed after clear_app_persistent_logs", exc_info=True
+                )
     return {"ok": len(errors) == 0, "deleted": deleted, "errors": errors}
 

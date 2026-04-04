@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -19,8 +21,17 @@ from config import (
     get_apify_default_actor_id,
     get_apify_token,
 )
-from utils.apify_helper import fetch_dataset_items, get_latest_succeeded_run
+from utils.apify_helper import (
+    fetch_dataset_items,
+    get_actor_run,
+    get_latest_succeeded_run,
+)
 from utils.db_manager import upsert_comp_catalog
+
+logger = logging.getLogger(__name__)
+
+_APIFY_RUN_POLL_TIMEOUT_SEC = 300.0
+_APIFY_RUN_POLL_INTERVAL_SEC = 3.0
 
 
 def _read_state() -> dict[str, Any]:
@@ -31,7 +42,8 @@ def _read_state() -> dict[str, Any]:
         with open(p, encoding="utf-8") as f:
             raw = json.load(f)
         return raw if isinstance(raw, dict) else {}
-    except Exception:
+    except Exception as e:
+        logger.error("apify _read_state failed path=%s: %s", p, e, exc_info=True)
         return {}
 
 
@@ -42,11 +54,52 @@ def _write_state(last_run_id: str, row_count: int) -> None:
         "row_count": row_count,
         "last_import_at": datetime.now(timezone.utc).isoformat(),
     }
+    d = os.path.dirname(p) or "."
     try:
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+        os.makedirs(d, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=d, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, p)
+        except Exception:
+            try:
+                if os.path.isfile(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError as oe:
+                logger.debug("apify _write_state tmp cleanup failed: %s", oe, exc_info=True)
+            raise
+    except OSError as e:
+        logger.warning("apify state write failed: %s", e)
+
+
+def wait_for_apify_run_terminal(
+    token: str,
+    run_id: str,
+    *,
+    timeout_sec: float = _APIFY_RUN_POLL_TIMEOUT_SEC,
+    poll_interval_sec: float = _APIFY_RUN_POLL_INTERVAL_SEC,
+) -> dict[str, Any]:
+    """
+    يستطلع حالة تشغيل الممثل حتى تنتهي (نجاح/فشل/إلغاء) أو يُرفع TimeoutError.
+    """
+    t0 = time.time()
+    rid = (run_id or "").strip()
+    tok = (token or "").strip()
+    if not rid or not tok:
+        raise ValueError("run_id and token are required")
+    while True:
+        if time.time() - t0 > timeout_sec:
+            raise TimeoutError(
+                f"Apify run {rid} did not reach a terminal status within {timeout_sec}s"
+            )
+        data = get_actor_run(tok, rid)
+        status = ""
+        if isinstance(data, dict):
+            status = str(data.get("status") or "").strip().upper()
+        if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT", "TIMED_OUT"):
+            return data
+        time.sleep(max(0.5, poll_interval_sec))
 
 
 def _parse_price(val: Any) -> float:
@@ -149,7 +202,8 @@ def sync_apify_catalog_from_cloud(
         out["run_id"] = rid
         return out
     try:
-        items = fetch_dataset_items(tok, ds, limit=50_000)
+        # تقليص الحد الأقصى لمنع قنبلة الذاكرة (OOM Kill) عند تحويل البيانات إلى Pandas
+        items = fetch_dataset_items(tok, ds, limit=4000)
     except Exception as e:
         out["error"] = str(e)[:300]
         out["reason"] = "fetch_dataset"
@@ -197,7 +251,8 @@ def try_apify_auto_import_sidebar() -> None:
     st.session_state["_apify_auto_import_monotonic"] = now
     try:
         res = sync_apify_catalog_from_cloud(force=False)
-    except Exception:
+    except Exception as e:
+        logger.error("apify auto-import on startup failed: %s", e, exc_info=True)
         return
     if res.get("ok") and int(res.get("rows") or 0) > 0:
         rid = str(res.get("run_id") or "")

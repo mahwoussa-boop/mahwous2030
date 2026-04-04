@@ -6,11 +6,14 @@ import csv
 import html
 import io
 import json
+import logging
 import os
 import re
 import pandas as pd
 from rapidfuzz import fuzz, process as rf_process
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+_logger = logging.getLogger(__name__)
 
 
 # ===== safe_float =====
@@ -129,30 +132,43 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
 
 
 # ===== export_to_excel =====
-def export_to_excel(df: pd.DataFrame, sheet_name: str = "النتائج") -> bytes:
-    """تصدير DataFrame إلى Excel"""
-    output = io.BytesIO()
-    export_df = df.copy()
+def export_to_excel(df: pd.DataFrame, sheet_name: str = "النتائج") -> Optional[bytes]:
+    """
+    تصدير DataFrame إلى Excel في الذاكرة (BytesIO) لتجنب PermissionError عند قفل ملف
+    على القرص؛ يُفضّل محرك xlsxwriter مع احتياطي openpyxl.
+    """
+    import logging
 
-    # إزالة الأعمدة غير القابلة للتسلسل
+    _log = logging.getLogger(__name__)
+    if df is None or df.empty:
+        return None
+
+    export_df = df.copy()
     for col in ["جميع المنافسين", "جميع_المنافسين"]:
         if col in export_df.columns:
             export_df = export_df.drop(columns=[col])
 
-    safe_name = sheet_name[:31]
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        export_df.to_excel(writer, sheet_name=safe_name, index=False)
-
-        # تنسيق العمود
-        ws = writer.sheets[safe_name]
-        for col in ws.columns:
-            max_len = max(
-                (len(str(cell.value or "")) for cell in col),
-                default=0,
-            )
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
-
-    return output.getvalue()
+    safe_name = str(sheet_name)[:31]
+    try:
+        output = io.BytesIO()
+        try:
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                export_df.to_excel(writer, index=False, sheet_name=safe_name)
+        except ImportError:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                export_df.to_excel(writer, sheet_name=safe_name, index=False)
+                ws = writer.sheets[safe_name]
+                for col in ws.columns:
+                    max_len = max(
+                        (len(str(cell.value or "")) for cell in col),
+                        default=0,
+                    )
+                    ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+        return output.getvalue()
+    except Exception as e:
+        _log.error("Excel export failed: %s", e)
+        return None
 
 
 # ===== export_multiple_sheets =====
@@ -210,23 +226,23 @@ def parse_pasted_text(text: str):
             try:
                 df = pd.DataFrame(rows[1:], columns=rows[0])
                 return df, f"✅ تم تحليل {len(df)} صف"
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.debug("parse_pasted_text pipe-table DataFrame failed: %s", e, exc_info=True)
 
     # محاولة 2: TSV (tabs)
     if '\t' in lines[0]:
         try:
             df = pd.read_csv(io.StringIO(text), sep='\t')
             return df, f"✅ تم تحليل {len(df)} صف (TSV)"
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.debug("parse_pasted_text TSV failed: %s", e, exc_info=True)
 
     # محاولة 3: CSV
     try:
         df = pd.read_csv(io.StringIO(text))
         return df, f"✅ تم تحليل {len(df)} صف (CSV)"
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.debug("parse_pasted_text CSV failed: %s", e, exc_info=True)
 
     # محاولة 4: كل سطر منتج
     if len(lines) >= 2:
@@ -318,14 +334,18 @@ def _load_valid_salla_category_paths() -> List[str]:
     try:
         from engines.pipeline_enrichment import _build_category_rows
         from engines.reference_data import CATEGORIES_CSV
-    except Exception:
+    except Exception as e:
+        _logger.debug("_load_valid_salla_category_paths import failed: %s", e, exc_info=True)
         return []
     cdf = None
     for enc in ("utf-8-sig", "utf-8"):
         try:
             cdf = pd.read_csv(CATEGORIES_CSV, encoding=enc, on_bad_lines="skip")
             break
-        except Exception:
+        except Exception as e:
+            _logger.debug(
+                "categories.csv read failed encoding=%s: %s", enc, e, exc_info=True
+            )
             continue
     if cdf is None or cdf.empty:
         return []
@@ -333,7 +353,8 @@ def _load_valid_salla_category_paths() -> List[str]:
         all_rows, sub_rows = _build_category_rows(cdf)
         pool = sub_rows if sub_rows else all_rows
         return [str(p["path"]).strip() for p in pool if p.get("path")]
-    except Exception:
+    except Exception as e:
+        _logger.error("_build_category_rows failed: %s", e, exc_info=True)
         return []
 
 
@@ -432,8 +453,8 @@ def _resolve_brand_for_salla(
             m = rf_process.extractOne(inf, canonical, scorer=fuzz.token_set_ratio)
             if m and m[1] >= 78:
                 return m[0]
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.debug("_infer_from_product failed: %s", e, exc_info=True)
         return ""
 
     if raw.lower() in ("غير محدد", "غير محدد.", "", "nan", "none"):
@@ -470,12 +491,14 @@ def _salla_export_context() -> Dict[str, Any]:
         from engines.reference_data import BRANDS_CSV
 
         bdf = pd.read_csv(BRANDS_CSV, encoding="utf-8-sig", on_bad_lines="skip")
-    except Exception:
+    except Exception as e:
+        _logger.debug("brands.csv utf-8-sig read failed: %s", e, exc_info=True)
         try:
             from engines.reference_data import BRANDS_CSV
 
             bdf = pd.read_csv(BRANDS_CSV, encoding="utf-8", on_bad_lines="skip")
-        except Exception:
+        except Exception as e2:
+            _logger.error("brands.csv read failed (utf-8 fallback): %s", e2, exc_info=True)
             bdf = pd.DataFrame()
     brand_lookup = _build_salla_brand_lookup(bdf)
     return {
@@ -524,15 +547,15 @@ def _strip_trailing_seo_json_from_mahwous_text(text: str) -> str:
         try:
             json.loads(tail)
             return head.strip()
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.debug("_strip_trailing_seo_json: tail not JSON: %s", e, exc_info=True)
     m = re.search(r"\n\s*(\{[\s\S]*\})\s*$", s)
     if m:
         try:
             json.loads(m.group(1))
             return s[: m.start()].strip()
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.debug("_strip_trailing_seo_json: regex block not JSON: %s", e, exc_info=True)
     return s
 
 
@@ -702,7 +725,8 @@ def ai_salla_description_for_missing_row(row: Dict[str, Any]) -> str:
             q = f"{brand} {name}".strip() if brand else name
             try:
                 frag = fetch_fragrantica_info(q) or {}
-            except Exception:
+            except Exception as e:
+                _logger.warning("fetch_fragrantica_info failed for q=%r: %s", q[:120], e, exc_info=True)
                 frag = {}
 
         ctx_bits: List[str] = []
@@ -737,7 +761,8 @@ def ai_salla_description_for_missing_row(row: Dict[str, Any]) -> str:
         if appendix:
             html_out = html_out + appendix
         return html_out
-    except Exception:
+    except Exception as e:
+        _logger.error("ai_salla_description_for_missing_row failed: %s", e, exc_info=True)
         return default_salla_missing_html_description(row)
 
 
