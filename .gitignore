@@ -1,11 +1,5 @@
-# Cursor MCP (نسخة حقيقية بالمفاتيح — لا ترفعها؛ انسخ من mcp.json.example)
-.cursor/mcp.json
-
 __pycache__/
 *.pyc
 *.pyo
 *.db
-data/scrape_events.ndjson
 .streamlit/secrets.toml
-.streamlit/secrets.toml
-API_SETUP.md
