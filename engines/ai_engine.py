@@ -1041,7 +1041,7 @@ def search_market_price(product_name, our_price=0):
             f"{product_name} price Saudi Arabia perfume shop",
         ]
         all_results = []
-        for q in queries[:3]:  # استخدام أول 3 استعلامات
+        for q in queries:  # العربية + الإنجليزي (كان [:3] يستبعد الاستعلام الأخير)
             ddg = _search_ddg(q)
             if ddg:
                 all_results.extend(ddg[:3])
