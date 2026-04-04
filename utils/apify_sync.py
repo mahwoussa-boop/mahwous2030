@@ -34,6 +34,17 @@ _APIFY_RUN_POLL_TIMEOUT_SEC = 300.0
 _APIFY_RUN_POLL_INTERVAL_SEC = 3.0
 
 
+def toast_apify_handoff(n_products: int) -> None:
+    """إشعار واجهة موحّد: تأكيد استلام الدفعة من Apify قبل التوزيع في المحرك."""
+    import streamlit as st
+
+    n = int(n_products)
+    st.toast(
+        f"📥 تم استلام {n} منتج من خوادم Apify بنجاح. جاري التوزيع...",
+        icon="📥",
+    )
+
+
 def _read_state() -> dict[str, Any]:
     p = apify_auto_import_state_path()
     if not os.path.isfile(p):
@@ -255,9 +266,4 @@ def try_apify_auto_import_sidebar() -> None:
         logger.error("apify auto-import on startup failed: %s", e, exc_info=True)
         return
     if res.get("ok") and int(res.get("rows") or 0) > 0:
-        rid = str(res.get("run_id") or "")
-        st.toast(
-            f"🎭 Apify: دُمج {res['rows']} منتجًا في المنافس «{get_apify_competitor_label()}» "
-            f"(تشغيل {rid[:12]}…)",
-            icon="✅",
-        )
+        toast_apify_handoff(int(res["rows"]))
