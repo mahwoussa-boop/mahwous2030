@@ -48,6 +48,14 @@ SCRAPER_BG_STATE_PATH = os.path.join(DATA_DIR, "scraper_bg_state.json")
 CHECKPOINT_JSON = os.path.join(DATA_DIR, "scraper_checkpoint.json")
 CHECKPOINT_CSV = os.path.join(DATA_DIR, "competitors_checkpoint.csv")
 
+# مهلة صارمة لكل طلب HTTP داخل الكشط — إن تجاهلت المكتبة مهلة المقبس، نُلغي المهمة ونُفرِغ السيمافور
+try:
+    _ARMORED_FETCH_WAIT_FOR_SEC = float(
+        os.environ.get("SCRAPER_ARMORED_FETCH_WAIT_FOR_SEC", "35") or "35"
+    )
+except ValueError:
+    _ARMORED_FETCH_WAIT_FOR_SEC = 35.0
+
 # 2. Strict Concurrency Control (OOM Prevention)
 _MAX_CONCURRENT_FETCH = int(os.environ.get("SCRAPER_MAX_CONCURRENT_FETCH", 3))
 if _MAX_CONCURRENT_FETCH > 5:
@@ -248,9 +256,9 @@ async def _async_jitter_sleep() -> None:
 
 
 async def _async_backoff_sleep(attempt: int) -> None:
-    """Exponential backoff + jitter لـ 403/429/5xx."""
-    base = min(5.0 * (2.0 ** attempt), 60.0)
-    jitter = random.uniform(0.5, 2.5)
+    """Exponential backoff + jitter لـ 403/429/5xx (سقف منخفض حتى لا تبدو الواجهة متجمّدة)."""
+    base = min(2.5 * (2.0 ** attempt), 12.0)
+    jitter = random.uniform(0.3, 1.5)
     await asyncio.sleep(base + jitter)
 
 
@@ -341,17 +349,22 @@ async def _async_http_get_armored(
     fetcher: AsyncScraperHTTP,
     url: str,
     timeout: float = 25.0,
-    max_attempts: int = 6,
+    max_attempts: int = 3,
 ) -> tuple[int, str] | None:
     """
     GET مع backoff أسي + jitter عند 403/429/5xx أو أخطاء الشبكة.
     يعيد (200, text) أو None. يُسجّل آخر رموز HTTP في _RECENT_HTTP_STATUS.
+    كل محاولة شبكة محصورة بـ asyncio.wait_for حتى لا يعلّق السيمافور إن تجاهلت المكتبة المهلة.
     """
     last_status = 0
+    hard_cap = max(_ARMORED_FETCH_WAIT_FOR_SEC, 5.0)
     for attempt in range(max_attempts):
         await _async_jitter_sleep()
         try:
-            code, text = await fetcher.get_text_once(url, timeout=timeout)
+            code, text = await asyncio.wait_for(
+                fetcher.get_text_once(url, timeout=timeout),
+                timeout=hard_cap,
+            )
             last_status = int(code or 0)
             _RECENT_HTTP_STATUS.append(last_status)
             if last_status == 429:
@@ -375,6 +388,15 @@ async def _async_http_get_armored(
             if last_status > 0:
                 await _async_backoff_sleep(attempt)
                 continue
+            await _async_backoff_sleep(attempt)
+        except asyncio.TimeoutError:
+            logger.error(
+                "CRITICAL HANG PREVENTED: Timeout fetching %s (>%ss). Task killed to save queue.",
+                (url or "")[:220],
+                hard_cap,
+            )
+            last_status = 0
+            _RECENT_HTTP_STATUS.append(0)
             await _async_backoff_sleep(attempt)
         except Exception:
             logger.warning(
@@ -1458,11 +1480,26 @@ async def _run_scraper_async(
         urls_processed_this_run = [len(salla_pre)]
         sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCH)
 
+        _scrape_outer_cap = max(
+            _ARMORED_FETCH_WAIT_FOR_SEC + 8.0,
+            40.0,
+        )
+
         async def _bounded_fetch_one(page_url: str) -> tuple[str, dict[str, Any] | None]:
             async with sem:
                 try:
-                    row = await _scrape_url_async(fetcher, page_url)
+                    row = await asyncio.wait_for(
+                        _scrape_url_async(fetcher, page_url),
+                        timeout=_scrape_outer_cap,
+                    )
                     return page_url, row
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "CRITICAL HANG PREVENTED: scrape pipeline timeout url=%s (>%ss). Semaphore released.",
+                        (page_url or "")[:220],
+                        _scrape_outer_cap,
+                    )
+                    return page_url, None
                 except asyncio.CancelledError:
                     raise
                 except Exception:

@@ -116,15 +116,19 @@ def _format_playwright_error(exc: BaseException) -> str:
 
 
 def _try_playwright_fallback() -> bool:
+    """
+    Playwright ثقيل على الذاكرة (مثلاً Railway 512MB) — لا يُفعّل إلا بموافقة صريحة.
+    SCRAPER_USE_PLAYWRIGHT=1|true|yes فقط (مجرد تثبيت الحزمة لا يكفي).
+    """
     v = os.environ.get("SCRAPER_USE_PLAYWRIGHT", "").strip().lower()
-    if v in ("0", "false", "no"):
+    if v not in ("1", "true", "yes", "on"):
         return False
     try:
         import playwright  # noqa: F401
 
         return True
     except ImportError:
-        return v in ("1", "true", "yes")
+        return False
 
 
 def _discover_with_fetch(full: str, origin: str, fetch: _UserFetch) -> tuple[str | None, str, bool]:
