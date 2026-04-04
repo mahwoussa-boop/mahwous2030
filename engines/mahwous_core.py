@@ -80,14 +80,14 @@ def _volume_indicates_sample_size(text: str) -> bool:
     for m in _ML_SAMPLE_RE.finditer(s):
         try:
             v = float(m.group("n").replace(",", "."))
-            if 0 < v <= 8.0:
+            if 0 < v <= 2.0:
                 return True
         except (TypeError, ValueError):
             continue
     for m in _OZ_SMALL_RE.finditer(s):
         try:
             oz = float(m.group("n").replace(",", "."))
-            if 0 < oz <= 0.28:
+            if 0 < oz <= 0.07:
                 return True
         except (TypeError, ValueError):
             continue

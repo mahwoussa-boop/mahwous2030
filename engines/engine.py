@@ -62,7 +62,7 @@ except Exception:
     SMART_MISSING_FUZZ_THRESHOLD = 88
 
 # أقل عتبة لمطابقة ذات معنى (منطقة Gemini 62–96%؛ أقل من ذلك → لا مرشح / مفقود بدون API)
-MATCH_MIN_SCORE = 62
+MATCH_MIN_SCORE = 40
 
 # ─── استيراد الإعدادات ───────────────────────
 try:
@@ -1203,7 +1203,7 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
     REVIEW_MAX           = 85  # أقل من هذا → مراجعة
     if override:
         dec = override
-    elif score < NO_MATCH_THRESHOLD:
+    elif score < 40:
         # نسبة منخفضة جداً → لا يظهر في أي واجهة
         return None  # ← الفلتر الحاسم: يُحذف من النتائج كلياً
     elif src in ("gemini", "auto", "vision", "auto_no_api") or score >= REVIEW_MAX:
