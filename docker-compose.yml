@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  mahwous-core:
+    build: .
+    container_name: mahwous_production
+    restart: always
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./mahwous_data:/app/data
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 14G
