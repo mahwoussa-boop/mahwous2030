@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 from functools import lru_cache
 from typing import Any
 
@@ -13,13 +14,18 @@ from rapidfuzz import fuzz, process as rf_process
 
 logger = logging.getLogger(__name__)
 
-_BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(_BASE, "data")
-BRANDS_CSV = os.path.join(DATA_DIR, "brands.csv")
-CATEGORIES_CSV = os.path.join(DATA_DIR, "categories.csv")
-OUR_CATALOG_CSV = os.path.join(DATA_DIR, "mahwous_catalog.csv")
-# اسم بديل كما في الدليل الهندسي (نفس المحتوى)
-OUR_CATALOG_ALIAS = os.path.join(DATA_DIR, "our_catalog.csv")
+_BASE_DIR = pathlib.Path(__file__).resolve().parent.parent
+_data_override = (os.environ.get("MAHWOUS_DATA_DIR") or "").strip()
+if _data_override:
+    DATA_DIR = pathlib.Path(_data_override).expanduser().resolve()
+else:
+    DATA_DIR = _BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+BRANDS_CSV = str(DATA_DIR / "brands.csv")
+CATEGORIES_CSV = str(DATA_DIR / "categories.csv")
+OUR_CATALOG_CSV = str(DATA_DIR / "mahwous_catalog.csv")
+OUR_CATALOG_ALIAS = str(DATA_DIR / "our_catalog.csv")
 
 
 def _norm_brand_token(s: str) -> str:

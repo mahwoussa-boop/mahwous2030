@@ -22,27 +22,49 @@ import requests as _req
 logger = logging.getLogger(__name__)
 
 
+def _strip_markdown_json_poison(s: str) -> str:
+    """إزالة سياجات Markdown والأسطر السامة (ثغرة 70) قبل استخراج JSON."""
+    t = s
+    t = re.sub(r"```\s*\w*\s*", "", t, flags=re.IGNORECASE | re.MULTILINE)
+    t = t.replace("```", "")
+    t = re.sub(r"^\s*---+\s*$", "", t, flags=re.MULTILINE)
+    t = re.sub(r"\s*```$", "", t, flags=re.IGNORECASE | re.MULTILINE).strip()
+    return t.strip()
+
+
 def _clean_ai_json(text: str) -> str:
     """
     يهيّئ نص الـ LLM للتحليل بـ json.loads: يزيل سياج markdown ويستخرج أول كائن/مصفوفة JSON.
-    إن تعذّر العثور على أقواس صالحة، يُعاد النص الأصلي ليحاول المتصل الفشل بشكل طبيعي.
+    يفضّل json.JSONDecoder.raw_decode لاحترام التداخل والنصوص (re.DOTALL ضمني في المسح).
     """
     if not isinstance(text, str):
         return ""
-    original = text
-    t = re.sub(r"```\w*", "", text, flags=re.IGNORECASE)
-    t = t.replace("```", "")
-    t = t.strip()
+    original = text.strip()
+    if not original:
+        return ""
+    t = _strip_markdown_json_poison(original)
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(t):
+        if ch not in "{[":
+            continue
+        try:
+            _, end = dec.raw_decode(t, i)
+            return t[i:end].strip()
+        except json.JSONDecodeError:
+            continue
+    m = re.search(r"(\{.*\}|\[.*\])", t, re.DOTALL)
+    if m:
+        return m.group(1).strip()
     i_arr = t.find("[")
     i_obj = t.find("{")
     if i_arr < 0 and i_obj < 0:
-        return original.strip()
+        return original
     if i_arr >= 0 and (i_obj < 0 or i_arr < i_obj):
         start, end = i_arr, t.rfind("]")
     else:
         start, end = i_obj, t.rfind("}")
     if start < 0 or end < 0 or end <= start:
-        return original.strip()
+        return original
     return t[start : end + 1].strip()
 
 
@@ -185,24 +207,26 @@ def _fuzzy_correct_brand(text: str, threshold: int = 82) -> str:
 
 # ─── SQLite Cache ───────────────────────────
 # خيوط متعددة (كشط + تحليل) تضرب نفس الملف؛ WAL + قفل + timeout يمنعون database is locked
-_DB = "match_cache_v21.db"
+# مسار ثابت تحت data/ حتى لا يُفقد الكاش عند إعادة تشغيل الحاوية (عكس tempfile)
+_BASE_DIR = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_DATA_DIR_CACHE = _os.path.join(_BASE_DIR, "data")
+_os.makedirs(_DATA_DIR_CACHE, exist_ok=True)
+_DB = _os.path.join(_DATA_DIR_CACHE, "match_cache_v26.db")
 _CACHE_LOCK = threading.Lock()
 
 
-def _cache_connect():
+def _get_cache_conn():
+    """اتصال كاش المطابقة: WAL + synchronous=NORMAL + busy_timeout لتقليل database is locked."""
     cn = sqlite3.connect(_DB, timeout=30.0, check_same_thread=False)
-    try:
-        cn.execute("PRAGMA journal_mode=WAL")
-        cn.execute("PRAGMA synchronous=NORMAL")
-        cn.execute("PRAGMA busy_timeout=30000")
-    except Exception:
-        logger.warning("match cache PRAGMA failed path=%s", _DB, exc_info=True)
+    cn.execute("PRAGMA journal_mode=WAL;")
+    cn.execute("PRAGMA synchronous=NORMAL;")
+    cn.execute("PRAGMA busy_timeout=30000")
     return cn
 
 
 def _init_db():
     try:
-        cn = _cache_connect()
+        cn = _get_cache_conn()
         cn.execute("CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, v TEXT, ts TEXT)")
         cn.commit()
         cn.close()
@@ -214,7 +238,7 @@ def _cget(k):
     with _CACHE_LOCK:
         cn = None
         try:
-            cn = _cache_connect()
+            cn = _get_cache_conn()
             r = cn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
             return json.loads(r[0]) if r else None
         except Exception:
@@ -229,14 +253,14 @@ def _cget(k):
                 try:
                     cn.close()
                 except Exception:
-                    pass
+                    logger.debug("match cache: conn.close failed after read", exc_info=True)
 
 
 def _cset(k, v):
     with _CACHE_LOCK:
         cn = None
         try:
-            cn = _cache_connect()
+            cn = _get_cache_conn()
             cn.execute(
                 "INSERT OR REPLACE INTO cache VALUES(?,?,?)",
                 (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat()),
@@ -253,7 +277,7 @@ def _cset(k, v):
                 try:
                     cn.close()
                 except Exception:
-                    pass
+                    logger.debug("match cache: conn.close failed after write", exc_info=True)
 
 
 _init_db()
@@ -322,13 +346,7 @@ def _no_api_resolve_row(
     sc = float(best0.get("score") or 0)
     if sc < MATCH_MIN_SCORE:
         return None
-    if MATCH_MIN_SCORE <= sc < 75:
-        return _row(
-            product, our_price, our_id, brand, size, ptype, gender,
-            best0, override="⚠️ تحت المراجعة", src="review_no_api",
-            all_cands=all_cands, our_img=our_img,
-        )
-    if 75 <= sc < 88:
+    if MATCH_MIN_SCORE <= sc < 88:
         return _row(
             product, our_price, our_id, brand, size, ptype, gender,
             best0, override="⚠️ تحت المراجعة", src="review_no_api",
@@ -413,6 +431,8 @@ def read_file(f):
 
 def _detect_double_header(df):
     """كشف ملفات ذات صفين عناوين (مثل ملف سلة الذي يحتوي على صف مجموعة + صف عناوين)"""
+    if df is None or df.empty:
+        return df
     cols = list(df.columns)
     unnamed_count = sum(1 for c in cols if str(c).startswith('Unnamed'))
     # إذا أغلب الأعمدة Unnamed → الصف الأول من البيانات قد يكون العناوين الحقيقية
@@ -455,10 +475,13 @@ def _smart_rename_columns(df):
                     float(str(v).replace(',', ''))
                     numeric_count += 1
                 except (ValueError, TypeError):
-                    pass
+                    pass  # عيّنة نصية متوقعة أثناء تخمين أعمدة الأسعار
             if numeric_count >= len(sample) * 0.7:
                 if 'السعر' not in new_cols.values():
-                    new_cols[col] = 'السعر'
+                    # Strict barrier against business logic destruction
+                    forbidden = ['تكلفة', 'تكلفه', 'cost', 'weight', 'وزن', 'id', 'sku', 'كمية', 'qty', 'stock']
+                    if not any(f in str(col).lower() for f in forbidden):
+                        new_cols[col] = 'السعر'
             else:
                 # يحتوي على نصوص → اسم المنتج
                 if 'المنتج' not in new_cols.values() and 'اسم المنتج' not in new_cols.values():
@@ -473,18 +496,28 @@ def normalize(text):
     """تطبيع قياسي: يوحّد الحروف والمرادفات مع الحفاظ على كامل النص"""
     if not isinstance(text, str): return ""
     t = text.strip().lower()
-    # 1. توحيد الهمزات أولاً (قبل أي استبدال)
-    for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
-                     ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
-        t = t.replace(src, dst)
-    # 2. المرادفات المخصصة
+    # 1. المرادفات المخصصة (الهمزات تُدار عبر _SYN)
     for k, v in WORD_REPLACEMENTS.items():
         t = t.replace(k.lower(), v)
-    # 3. قاموس المرادفات الشامل
+    # 2. قاموس المرادفات الشامل
     for k, v in _SYN.items():
         t = t.replace(k, v)
     t = re.sub(r'[^\w\s\u0600-\u06FF.]', ' ', t)
     return re.sub(r'\s+', ' ', t).strip()
+
+
+_HAMZA_UNIFY = str.maketrans(
+    {
+        "أ": "ا",
+        "إ": "ا",
+        "آ": "ا",
+        "ة": "ه",
+        "ى": "ي",
+        "ؤ": "و",
+        "ئ": "ي",
+        "ـ": "",
+    }
+)
 
 
 def normalize_name(text):
@@ -495,12 +528,8 @@ def normalize_name(text):
     المثال: 'عطر ايسينشيال بيرفيوم فيج انفيوجن 100مل' → 'essential فيج infusion'
     """
     if not isinstance(text, str): return ""
-    t = text.strip().lower()
-    # 1. توحيد الهمزات أولاً
-    for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
-                     ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
-        t = t.replace(src, dst)
-    # 2. قاموس المرادفات (ترجمة التهجئات البديلة)
+    t = text.strip().lower().translate(_HAMZA_UNIFY)
+    # 1. قاموس المرادفات (ترجمة التهجئات البديلة؛ أ/إ/آ مُكمّلة عبر _SYN أيضاً)
     for k, v in _SYN.items():
         t = t.replace(k, v)
     # 3. حذف كلمات الضجيج
@@ -514,15 +543,22 @@ def normalize_name(text):
 normalize_aggressive = normalize_name
 
 def extract_size(text):
-    if not isinstance(text, str): return 0.0
+    """يستخرج حجم العبوة الرئيسية بالمل: عند وجود عدة أحجام (مثلاً 100مل + عينة 5مل) يُؤخذ الأكبر."""
+    if not text or not isinstance(text, str):
+        return 0.0
     tl = text.lower()
-    # البحث عن oz أولاً وتحويله لـ ml
-    oz = re.findall(r'(\d+(?:\.\d+)?)\s*(?:oz|ounce)', tl)
-    if oz:
-        return float(oz[0]) * 29.5735  # 1 oz = 29.5735 ml
-    # البحث عن ml
-    ml = re.findall(r'(\d+(?:\.\d+)?)\s*(?:ml|مل|ملي|milliliter)', tl)
-    return float(ml[0]) if ml else 0.0
+    candidates: list[float] = []
+    for x in re.findall(r"(\d+(?:\.\d+)?)\s*(?:oz|ounce)", tl):
+        try:
+            candidates.append(float(x) * 29.5735)  # 1 oz ≈ 29.5735 ml
+        except ValueError as e:
+            logger.debug("extract_size: skip oz match %r: %s", x, e, exc_info=True)
+    for x in re.findall(r"(\d+(?:\.\d+)?)\s*(?:ml|مل|ملي|milliliter)", tl):
+        try:
+            candidates.append(float(x))
+        except ValueError as e:
+            logger.debug("extract_size: skip ml match %r: %s", x, e, exc_info=True)
+    return max(candidates) if candidates else 0.0
 
 
 # ── Capacity & bundle guardrail (_CAP_VOL_RE / _BUNDLE_KW_RE من match_rules) ──
@@ -679,9 +715,7 @@ def extract_product_line(text, brand=""):
     n = re.sub(r'\d+(?:\.\d+)?\s*(ml|مل|ملي|oz|لتر)\b', ' ', n)
     # إزالة الرموز
     n = re.sub(r'[^\w\s\u0600-\u06FF]', ' ', n)
-    # توحيد الهمزات
-    for k, v in {'أ':'ا','إ':'ا','آ':'ا','ة':'ه','ى':'ي'}.items():
-        n = n.replace(k, v)
+    n = n.translate(_HAMZA_UNIFY)
     return re.sub(r'\s+', ' ', n).strip()
 
 def is_sample(t):
@@ -764,7 +798,21 @@ def _fcol(df, cands):
     # بحث 3: بحث جزئي (العمود يحتوي على الكلمة المفتاحية)
     for c in cands:
         for col in cols:
-            if c in col or _norm_ar(c) in _norm_ar(col):
+            if c in str(col).lower() or _norm_ar(c) in _norm_ar(str(col)):
+                # Fatal barrier — لا تخلط عمود «سعر التكلفة» أو المخفض مع سعر البيع
+                if any(
+                    bad in str(col).lower()
+                    for bad in (
+                        "تكلفة",
+                        "تكلفه",
+                        "cost",
+                        "مخفض",
+                        "شطب",
+                        "قبل",
+                        "old",
+                    )
+                ):
+                    continue
                 return col
     return ""
 
@@ -1012,10 +1060,25 @@ def _ai_batch(batch):
     if not batch:
         return []
 
-    # ── cache ────────────────────────────────────────────────────────────
-    ck = hashlib.md5(json.dumps(
-        [{"o": x["our"], "c": [c["name"] for c in x["candidates"]]} for x in batch],
-        ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    # ── cache (أسماء + أسعار + أحجام — لا يُسمم الكاش بتجاهل تغيّر السعر/الحجم) ──
+    ck_payload = [
+        {
+            "o": x["our"],
+            "p": float(x.get("price", 0) or 0),
+            "c": [
+                {
+                    "n": c["name"],
+                    "p": float(c.get("price", 0) or 0),
+                    "s": float(c.get("size", 0) or 0),
+                }
+                for c in x["candidates"]
+            ],
+        }
+        for x in batch
+    ]
+    ck = hashlib.md5(
+        json.dumps(ck_payload, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
     cached = _cget(ck)
     if cached is not None:
         return cached
@@ -1066,7 +1129,7 @@ def _ai_batch(batch):
                 elif n == 0:
                     out.append(-1)
                 else:
-                    out.append(0)
+                    out.append(-1)
             return out if len(out) == len(batch) else None
         except Exception:
             logger.error(
@@ -1085,10 +1148,15 @@ def _ai_batch(batch):
         if not key:
             continue
         try:
-            r = _req.post(f"{_GURL}?key={key}", json=g_payload, timeout=25)
+            # توازن بين عدم تجميد الخيط ومنح التوليد وقتاً معقولاً (15–20 ثانية)
+            r = _req.post(f"{_GURL}?key={key}", json=g_payload, timeout=15.0)
             if r.status_code == 200:
-                txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                out = _parse(txt)
+                try:
+                    data = r.json()
+                    txt = data["candidates"][0]["content"]["parts"][0]["text"]
+                except (ValueError, KeyError, IndexError, TypeError):
+                    txt = ""
+                out = _parse(txt) if txt else None
                 if out:
                     _cset(ck, out)
                     return out
@@ -1096,10 +1164,14 @@ def _ai_batch(batch):
                 # rate limit → انتظر أطول ثم جرب نفس المفتاح مرة أخرى
                 time.sleep(3)
                 try:
-                    r2 = _req.post(f"{_GURL}?key={key}", json=g_payload, timeout=25)
+                    r2 = _req.post(f"{_GURL}?key={key}", json=g_payload, timeout=15.0)
                     if r2.status_code == 200:
-                        txt = r2.json()["candidates"][0]["content"]["parts"][0]["text"]
-                        out = _parse(txt)
+                        try:
+                            data2 = r2.json()
+                            txt = data2["candidates"][0]["content"]["parts"][0]["text"]
+                        except (ValueError, KeyError, IndexError, TypeError):
+                            txt = ""
+                        out = _parse(txt) if txt else None
                         if out:
                             _cset(ck, out)
                             return out
@@ -1132,8 +1204,12 @@ def _ai_batch(batch):
                     "HTTP-Referer": "https://mahwous.com",
                 }, timeout=30)
                 if r.status_code == 200:
-                    txt = r.json()["choices"][0]["message"]["content"]
-                    out = _parse(txt)
+                    try:
+                        data_or = r.json()
+                        txt = data_or["choices"][0]["message"]["content"]
+                    except (ValueError, KeyError, IndexError, TypeError):
+                        txt = ""
+                    out = _parse(txt) if txt else None
                     if out:
                         _cset(ck, out)
                         return out

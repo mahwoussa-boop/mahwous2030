@@ -11,8 +11,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+
+import pandas as pd
 from html import unescape
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -120,13 +123,19 @@ def _pick_name(d: dict[str, Any]) -> str:
 
 def _pick_price(d: dict[str, Any]) -> float | None:
     for k in ("price", "sale_price", "regular_price", "amount", "final_price", "min_price"):
-        p = _as_float(d.get(k))
+        v = d.get(k)
+        if isinstance(v, dict) and "amount" in v:
+            v = v.get("amount")
+        p = _as_float(v)
         if p is not None and p > 0:
             return p
     pr = d.get("pricing")
     if isinstance(pr, dict):
         for k in ("price", "amount"):
-            p = _as_float(pr.get(k))
+            v = pr.get(k)
+            if isinstance(v, dict) and "amount" in v:
+                v = v.get("amount")
+            p = _as_float(v)
             if p is not None and p > 0:
                 return p
     return None
@@ -256,7 +265,7 @@ async def collect_salla_products_fast_path(
 
     async def get(u: str) -> tuple[int, str | None]:
         if hasattr(fetcher, "get_text_once"):
-            return await fetcher.get_text_once(u, timeout=28.0)
+            return await fetcher.get_text_once(u, timeout=15.0)
         return 0, None
 
     # صفحة رئيسية + صفحة منتجات لاكتشاف buildId وعلامات سلة
@@ -292,7 +301,12 @@ async def collect_salla_products_fast_path(
         for rel in _next_data_paths_to_try():
             for page in range(1, max_pages + 1):
                 u = f"{origin}/_next/data/{build_id}/{rel}?page={page}"
+                await asyncio.sleep(0.3)  # حماية استباقية من الحظر
                 code, txt = await get(u)
+                if code == 429:
+                    logger.warning("salla 429 hit (Next.js). Sleeping 5s.")
+                    await asyncio.sleep(5.0)
+                    code, txt = await get(u)
                 if code != 200 or not txt:
                     break
                 try:
@@ -321,7 +335,12 @@ async def collect_salla_products_fast_path(
         for page in range(1, min(max_pages, 200) + 1):
             sep = "&" if "?" in base else "?"
             u = f"{base}{sep}page={page}&per_page={per_page_hint}"
+            await asyncio.sleep(0.3)  # حماية استباقية من الحظر
             code, txt = await get(u)
+            if code == 429:
+                logger.warning("salla 429 hit (API). Sleeping 5s.")
+                await asyncio.sleep(5.0)
+                code, txt = await get(u)
             if code != 200 or not txt or not txt.lstrip().startswith("{"):
                 break
             try:
@@ -362,4 +381,7 @@ async def collect_salla_products_fast_path(
 
     if uniq:
         logger.info("salla fast path: collected=%s origin=%s", len(uniq), origin)
+        _df = pd.DataFrame(uniq)
+        _df["price"] = pd.to_numeric(_df["price"], errors="coerce")
+        uniq = _df.to_dict("records")
     return uniq

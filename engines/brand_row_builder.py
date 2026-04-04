@@ -9,10 +9,13 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import re
 from typing import Any
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 # نفس ترتيب ملف مهووس الافتراضي إن تعذر القراءة
 DEFAULT_BRAND_COLUMNS: tuple[str, ...] = (
@@ -173,6 +176,6 @@ def ai_fill_brand_seo_fields(brand_display_name: str) -> dict[str, str]:
             ):
                 if data.get(k):
                     out[k] = str(data[k]).strip()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("brand SEO JSON parse from AI failed: %s", e, exc_info=True)
     return out

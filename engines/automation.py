@@ -8,6 +8,7 @@ engines/automation.py v26.0 — محرك الأتمتة الذكي الكامل
 ✅ جدولة عمليات بحث دورية
 ✅ حماية ضد القرارات الخاطئة (حدود أمان)
 """
+import concurrent.futures
 import json
 import logging
 import time
@@ -203,25 +204,9 @@ class AutomationEngine:
                 decisions.append(d)
         return decisions
 
-    def get_summary(self) -> Dict:
-        """ملخص إحصائي"""
-        with self._lock:
-            log = list(self.decisions_log)  # نسخة من deque
-        if not log:
-            return {"total": 0, "lower": 0, "raise": 0, "keep": 0,
-                    "savings": 0, "gains": 0, "net_impact": 0}
-        lower_c = sum(1 for d in log if d["action"] == "lower_price")
-        raise_c = sum(1 for d in log if d["action"] == "raise_price")
-        keep_c = sum(1 for d in log if d["action"] == "keep_price")
-        review_c = sum(1 for d in log if d.get("action") == "review")
-        savings = sum(d["old_price"] - d["new_price"] for d in log if d["action"] == "lower_price")
-        gains = sum(d["new_price"] - d["old_price"] for d in log if d["action"] == "raise_price")
-        return {
-            "total": len(log), "lower": lower_c, "raise": raise_c, "keep": keep_c,
-            "review": review_c,
-            "savings": round(savings, 2), "gains": round(gains, 2),
-            "net_impact": round(gains - savings, 2),
-        }
+    def get_summary(self, db_path=None) -> Dict:
+        """ملخص من SQLite (WAL) — لا يعتمد على deque الذاكرة."""
+        return get_automation_stats(days=7, db=db_path or DB_PATH)
 
     def clear_log(self):
         with self._lock:
@@ -329,8 +314,8 @@ class ScheduledSearchManager:
         m = int((remaining.total_seconds() % 3600) // 60)
         return f"{h} ساعة و {m} دقيقة"
 
-    def run_scan(self, products_df: pd.DataFrame, top_n: int = 20) -> List[Dict]:
-        """مسح السوق لأهم المنتجات"""
+    def _run_scan_core(self, products_df: pd.DataFrame, top_n: int = 20) -> List[Dict]:
+        """منطق مسح السوق (يُستدعى من worker خيط المنفّذ)."""
         try:
             from engines.ai_engine import search_market_price
         except ImportError:
@@ -368,7 +353,7 @@ class ScheduledSearchManager:
                         })
                 except (requests.exceptions.RequestException, ValueError, TypeError, KeyError):
                     continue
-                time.sleep(1)
+                time.sleep(0.2)  # تم تقليص وقت النوم لمنع تجميد الواجهة (UI Freeze)
 
             with self._lock:
                 self.last_run = datetime.now()
@@ -380,15 +365,41 @@ class ScheduledSearchManager:
                 self.is_running = False
             return []
 
+    def run_scan(self, products_df: pd.DataFrame, top_n: int = 20) -> List[Dict]:
+        """مسح السوق لأهم المنتجات — عبر ThreadPoolExecutor مع تسجيل أي انهيار في الخيط."""
+
+        def _automation_error_callback(fut: concurrent.futures.Future) -> None:
+            try:
+                fut.result()
+            except Exception as e:
+                logger.error(
+                    "انهيار صامت في خيط الأتمتة (Automation Thread Crash): %s",
+                    e,
+                    exc_info=True,
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(self._run_scan_core, products_df, top_n)
+            future.add_done_callback(_automation_error_callback)
+            return future.result()
+
 
 # ═══════════════════════════════════════════════════════
 #  4. تسجيل في قاعدة البيانات
 # ═══════════════════════════════════════════════════════
+def _apply_automation_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    """يتوافق مع سياسة الإنتاج: WAL + synchronous=NORMAL + busy_timeout."""
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000")
+
+
 def _ensure_automation_table(db=None):
     """إنشاء جدول الأتمتة إذا لم يكن موجوداً"""
     path = db or DB_PATH
     try:
-        with sqlite3.connect(path, check_same_thread=False, timeout=30) as conn:
+        with sqlite3.connect(path, check_same_thread=False, timeout=30.0) as conn:
+            _apply_automation_sqlite_pragmas(conn)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS automation_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -416,7 +427,8 @@ def log_automation_decision(decision: dict, pushed: bool = False, db=None):
     path = db or DB_PATH
     _ensure_automation_table(path)
     try:
-        with sqlite3.connect(path, check_same_thread=False, timeout=30) as conn:
+        with sqlite3.connect(path, check_same_thread=False, timeout=30.0) as conn:
+            _apply_automation_sqlite_pragmas(conn)
             conn.execute(
                 """INSERT INTO automation_log
                    (product_name, product_id, rule_name, action, old_price,
@@ -440,7 +452,8 @@ def get_automation_log(limit: int = 50, db=None) -> List[Dict]:
     _ensure_automation_table(path)
     conn = None
     try:
-        conn = sqlite3.connect(path, check_same_thread=False)
+        conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+        _apply_automation_sqlite_pragmas(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM automation_log ORDER BY id DESC LIMIT ?", (limit,)
@@ -451,39 +464,88 @@ def get_automation_log(limit: int = 50, db=None) -> List[Dict]:
         return []
     finally:
         if conn:
-            try: conn.close()
-            except Exception: pass
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("automation: conn.close failed after get_automation_log", exc_info=True)
 
 
 def get_automation_stats(days: int = 7, db=None) -> Dict:
-    """إحصائيات الأتمتة لآخر X يوم"""
+    """إحصائيات الأتمتة لآخر X يوم — من SQLite مع مراجعة وتأثير مالي."""
     path = db or DB_PATH
     _ensure_automation_table(path)
     conn = None
     try:
-        conn = sqlite3.connect(path, check_same_thread=False)
+        conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+        _apply_automation_sqlite_pragmas(conn)
         since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         total = conn.execute(
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=?", (since,)
         ).fetchone()[0]
         lower = conn.execute(
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND action='lower_price'",
-            (since,)
+            (since,),
         ).fetchone()[0]
         raised = conn.execute(
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND action='raise_price'",
-            (since,)
+            (since,),
+        ).fetchone()[0]
+        keep = conn.execute(
+            "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND action='keep_price'",
+            (since,),
+        ).fetchone()[0]
+        review = conn.execute(
+            "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND action='review'",
+            (since,),
         ).fetchone()[0]
         pushed = conn.execute(
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND pushed_to_make=1",
-            (since,)
+            (since,),
         ).fetchone()[0]
-        return {"total": total, "lower": lower, "raise": raised,
-                "keep": total - lower - raised, "pushed": pushed}
+        savings = float(
+            conn.execute(
+                """SELECT COALESCE(SUM(old_price - new_price), 0) FROM automation_log
+                   WHERE timestamp>=? AND action='lower_price'""",
+                (since,),
+            ).fetchone()[0]
+            or 0
+        )
+        gains = float(
+            conn.execute(
+                """SELECT COALESCE(SUM(new_price - old_price), 0) FROM automation_log
+                   WHERE timestamp>=? AND action='raise_price'""",
+                (since,),
+            ).fetchone()[0]
+            or 0
+        )
+        net_impact = round(gains - savings, 2)
+        return {
+            "total": total,
+            "lower": lower,
+            "raise": raised,
+            "keep": keep,
+            "review": review,
+            "pushed": pushed,
+            "savings": round(savings, 2),
+            "gains": round(gains, 2),
+            "net_impact": net_impact,
+        }
     except sqlite3.Error as e:
         logger.warning("automation: get stats failed path=%r: %s", path, e)
-        return {"total": 0, "lower": 0, "raise": 0, "keep": 0, "pushed": 0}
+        return {
+            "total": 0,
+            "lower": 0,
+            "raise": 0,
+            "keep": 0,
+            "review": 0,
+            "pushed": 0,
+            "savings": 0.0,
+            "gains": 0.0,
+            "net_impact": 0.0,
+        }
     finally:
         if conn:
-            try: conn.close()
-            except Exception: pass
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("automation: conn.close failed after get_automation_stats", exc_info=True)

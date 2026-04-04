@@ -4,10 +4,13 @@
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 import pandas as pd
+
+_log = logging.getLogger(__name__)
 
 try:
     from config import REJECT_KEYWORDS
@@ -36,9 +39,9 @@ _ACCESSORY_BANNED = (
     "pouch only",
 )
 
-# حجم عينة: ≤ 8 مل (أو ما يعادلها تقريباً في الأونصة)
+# حجم عينة: < 8 مل (أو ما يعادلها تقريباً في الأونصة) — يدعم 1.5ml وغيره
 _ML_SAMPLE_RE = re.compile(
-    r"(?P<n>\d+(?:[.,]\d+)?)\s*(ml|مل|ملي|milliliter)\b",
+    r"(?P<n>\d+(?:\.\d+)?)\s*(ml|مل|ملي|milliliter)\b",
     re.IGNORECASE,
 )
 _OZ_SMALL_RE = re.compile(
@@ -73,14 +76,14 @@ def _has_banned_phrase(text: str, phrase: str) -> bool:
 
 
 def _volume_indicates_sample_size(text: str) -> bool:
-    """يُستبعد إن وُجد في الاسم حجم ≤ 8 مل، أو أونصة صغيرة جداً (≤0.28 oz ≈ 8 مل)."""
+    """يُستبعد إن وُجد في الاسم حجم < 8 مل (عينة)، أو أونصة صغيرة جداً."""
     if not text:
         return False
     s = str(text)
     for m in _ML_SAMPLE_RE.finditer(s):
         try:
             v = float(m.group("n").replace(",", "."))
-            if 0 < v <= 2.0:
+            if 0 < v < 8.0:
                 return True
         except (TypeError, ValueError):
             continue
@@ -201,7 +204,8 @@ def _row_brand_explicit(row: pd.Series) -> str:
     for key in _BRAND_COL_CANDS:
         try:
             b = str(row.get(key, "") or "").strip()
-        except Exception:
+        except Exception as e:
+            _log.debug("_row_brand_explicit skip key=%r: %s", key, e, exc_info=True)
             continue
         if b and b.lower() not in ("nan", "none", "—", "-"):
             return b
@@ -236,7 +240,8 @@ def _effective_brand_for_export(row: pd.Series, known_brands: list[str]) -> str:
     for nc in ("منتج_المنافس", "المنتج", "اسم المنتج"):
         try:
             n = str(row.get(nc, "") or "").strip()
-        except Exception:
+        except Exception as e:
+            _log.debug("_effective_brand_for_export name col %r failed: %s", nc, e, exc_info=True)
             n = ""
         if n:
             name = n

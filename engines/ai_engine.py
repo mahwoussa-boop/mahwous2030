@@ -15,6 +15,14 @@ import os as _os
 import requests, json, re, time, traceback
 from config import get_gemini_api_keys, get_openrouter_api_key, get_cohere_api_key
 
+# رسائل المستخدم عند عدم توفر AI
+USER_MSG_AI_UNAVAILABLE = (
+    "تعذّر إكمال الطلب الآن — جرّب إعادة المحاولة أو تحقق من الاتصال والمفاتيح."
+)
+USER_MSG_VERIFY_UNAVAILABLE = (
+    "تعذّر التحقق الآن — جرّب إعادة المحاولة أو تحقق من الاتصال والمفاتيح."
+)
+
 # أخطاء متوقعة عند استدعاءات HTTP/JSON — لا تُبتلع كل شيء بـ except عريض
 _NARROW_IO = (
     ValueError,
@@ -336,7 +344,7 @@ def vision_match_court(
         f"نسبة التطابق النصي السابقة: {fuzzy_score:.1f}%\n\n"
         "الصورة الأولى لمنتجنا، الثانية لمنتج المنافس.\n"
         "هل يمثلان نفس العطر بالتجزئة (نفس الحجم ml تقريباً، نفس التركيز EDP/EDT/EDC، وليس تستر مقابل عطر كامل)؟\n"
-        'أجب JSON فقط بدون شرح إضافي: {"same_product":true أو false,"reason":"سبب مختصر بالعربية"}'
+        'أجب JSON فقط: {"same_product": true, "reason": "سبب مختصر"}'
     )
 
     parts: list = [{"text": prompt}]
@@ -355,7 +363,10 @@ def vision_match_court(
             r = requests.post(f"{_GVU}?key={key}", json=payload, timeout=45)
             if r.status_code != 200:
                 continue
-            data = r.json()
+            try:
+                data = r.json()
+            except ValueError:
+                continue
             txt = _gemini_response_text(data)
             if not txt:
                 continue
@@ -385,9 +396,13 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     # لا نقتصّ الـ system الطويل (مثل MAHWOUS_EXPERT_SYSTEM) — فقط مدخلات المستخدم/البيانات الديناميكية
     prompt = _clip_prompt(prompt, 24000)
     full = f"{system}\n\n{prompt}" if system else prompt
+    config = {"temperature": temperature, "maxOutputTokens": max_tokens}
+    if not grounding:
+        config["topP"] = 0.85
+
     payload = {
         "contents": [{"parts": [{"text": full}]}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens, "topP": 0.85}
+        "generationConfig": config,
     }
     if grounding:
         payload["tools"] = [{"google_search": {}}]
@@ -403,11 +418,18 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
         try:
             r = requests.post(f"{_GU}?key={key}", json=payload, timeout=45)
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except ValueError:
+                    continue
                 text = _gemini_response_text(data)
                 if text:
                     return text
-                reason = (data.get("promptFeedback") or {}).get("blockReason", "") if isinstance(data, dict) else ""
+                reason = (
+                    (data.get("promptFeedback") or {}).get("blockReason", "")
+                    if isinstance(data, dict)
+                    else ""
+                )
                 _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
             elif r.status_code == 429:
                 _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — انتظار 2 ثانية")
@@ -460,7 +482,10 @@ def _call_openrouter(prompt, system=""):
             }, timeout=45)
 
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except ValueError:
+                    continue
                 content = _openrouter_message_content(data)
                 if content and content.strip():
                     return content
@@ -571,38 +596,7 @@ def _parse_json(txt):
     return None
 
 def _search_ddg(query, num_results=5):
-    """بحث DuckDuckGo مجاني"""
-    try:
-        r = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
-            timeout=8,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if not isinstance(data, dict):
-                return []
-            results: list[dict] = []
-            if data.get("AbstractText"):
-                results.append(
-                    {
-                        "title": str(data.get("Heading") or "").strip(),
-                        "snippet": data["AbstractText"],
-                        "url": data.get("AbstractURL", ""),
-                    }
-                )
-            for rel in (data.get("RelatedTopics") or [])[:num_results]:
-                if isinstance(rel, dict) and rel.get("Text"):
-                    results.append(
-                        {
-                            "title": "",
-                            "snippet": rel.get("Text", ""),
-                            "url": rel.get("FirstURL", ""),
-                        }
-                    )
-            return results
-    except _NARROW_IO:
-        pass
+    """تم إيقاف الاعتماد على DuckDuckGo لمنع هلوسة السعر؛ الاعتماد على Gemini Grounding."""
     return []
 
 def call_ai(prompt, page="general"):
@@ -635,16 +629,25 @@ def gemini_chat(message, history=None, system_extra=""):
         contents.append({"role":"user","parts":[{"text":h["user"]}]})
         contents.append({"role":"model","parts":[{"text":h["ai"]}]})
     contents.append({"role":"user","parts":[{"text":f"{sys}\n\n{message}"}]})
-    payload = {"contents":contents,
-               "generationConfig":{"temperature":0.4,"maxOutputTokens":4096,"topP":0.9}}
+    config = {"temperature": 0.4, "maxOutputTokens": 4096}
+    if not needs_web:
+        config["topP"] = 0.9
+
+    payload = {
+        "contents": contents,
+        "generationConfig": config,
+    }
     if needs_web:
-        payload["tools"] = [{"google_search":{}}]
+        payload["tools"] = [{"google_search": {}}]
     for key in get_gemini_api_keys():
         if not key: continue
         try:
             r = requests.post(f"{_GU}?key={key}", json=payload, timeout=40)
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except ValueError:
+                    continue
                 text = _gemini_response_text(data)
                 if text:
                     return {
@@ -936,16 +939,29 @@ def reclassify_review_items(items):
                      f" vs منافس: {it['comp']} ({it.get('comp_price',0):.0f}ر.س) | فرق: {diff:+.0f}ر.س")
     prompt = f"""حلل هذه المنتجات وحدد القسم الصحيح لكل منها:
 {chr(10).join(lines)}
+
+الشروط:
 - سعر اعلى: نفس المنتج + سعرنا اعلى بـ10+ ريال
 - سعر اقل: نفس المنتج + سعرنا اقل بـ10+ ريال
 - موافق: نفس المنتج + فرق 10 ريال او اقل
-- مفقود: ليسا نفس المنتج"""
+- مفقود: ليسا نفس المنتج
+
+التعليمات الصارمة: يجب الرد حصراً بصيغة مصفوفة JSON (Array)، كل كائن فيها يجب أن يحتوي على:
+1. "idx": رقم المنتج الموجود بين الأقواس المربعة أعلاه.
+2. "section": اسم القسم المختار بناءً على الشروط.
+3. "confidence": نسبة الثقة في قرارك (من 0 إلى 100)."""
     sys = PAGE_PROMPTS["reclassify"]
     txt = _call_gemini(prompt, sys, temperature=0.1) or _call_openrouter(prompt, sys)
     if not txt: return []
     data = _parse_json(txt)
-    if data and "results" in data:
-        for r in data["results"]:
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict) and "results" in data:
+        rows = data["results"]
+    else:
+        rows = None
+    if rows:
+        for r in rows:
             sec = r.get("section","")
             if "اعلى" in sec or "أعلى" in sec: r["section"] = "🔴 سعر أعلى"
             elif "اقل" in sec or "أقل" in sec:  r["section"] = "🟢 سعر أقل"
@@ -956,7 +972,7 @@ def reclassify_review_items(items):
                 r["confidence"] = float(r.get("confidence") or 0)
             except (TypeError, ValueError):
                 r["confidence"] = 0.0
-        return data["results"]
+        return rows
     return []
 
 

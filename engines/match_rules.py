@@ -1,5 +1,8 @@
 ﻿"""قواعد المطابقة والمرادفات لمحرك مهووس"""
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 try:
     from config import (
@@ -47,19 +50,19 @@ _SYN = {
     "دانهيل":"dunhill","بنتلي":"bentley","كينزو":"kenzo","لاكوست":"lacoste",
     "فندي":"fendi","ايلي صعب":"elie saab","ازارو":"azzaro",
     "فيراغامو":"ferragamo","شوبار":"chopard","بوشرون":"boucheron",
-    "لانكم":"lancome","لانكوم":"lancome","جيفنشي":"givenchy","جيفانشي":"givenchy",
-    "بربري":"burberry","بيربري":"burberry","بوربيري":"burberry",
-    "فيرساتشي":"versace","فرزاتشي":"versace",
+    "لانكم":"lancome","جيفانشي":"givenchy",
+    "بوربيري":"burberry",
+    "فرزاتشي":"versace",
     "روبيرتو كفالي":"roberto cavalli","روبرتو كافالي":"roberto cavalli",
     "سلفاتوري":"ferragamo","سالفاتوري":"ferragamo",
-    "ايف سان لوران":"ysl","ايف سانت لوران":"ysl",
+    "ايف سانت لوران":"ysl",
     "هيرميس":"hermes","ارميس":"hermes","هرمز":"hermes",
     "كيليان":"kilian","كليان":"kilian",
     "نيشان":"nishane","نيشاني":"nishane",
     "زيرجوف":"xerjoff","زيرجوفف":"xerjoff",
     "بنهاليغونز":"penhaligons","بنهاليغون":"penhaligons",
     "مارلي":"parfums de marly","دي مارلي":"parfums de marly",
-    "جيرلان":"guerlain","غيرلان":"guerlain","جرلان":"guerlain",
+    "جيرلان":"guerlain","جرلان":"guerlain",
     "تيزيانا ترينزي":"tiziana terenzi","تيزيانا":"tiziana terenzi",
     "ناسوماتو":"nasomatto",
     "ميزون مارجيلا":"maison margiela","مارجيلا":"maison margiela","ربليكا":"replica",
@@ -67,7 +70,7 @@ _SYN = {
     "مايزون فرانسيس":"maison francis kurkdjian","فرانسيس":"maison francis kurkdjian",
     "بايريدو":"byredo","لي لابو":"le labo",
     "مانسيرا":"mancera","مونتالي":"montale","روجا":"roja",
-    "جو مالون":"jo malone","جومالون":"jo malone",
+    "جومالون":"jo malone",
     "ثمين":"thameen","أمادو":"amadou","امادو":"amadou",
     "انيشيو":"initio","إنيشيو":"initio","initio":"initio",
     "جيمي تشو":"jimmy choo","جيميتشو":"jimmy choo",
@@ -97,7 +100,7 @@ _SYN = {
     # ── تهجئات بديلة لكلمات العطور (الأهم للمطابقة) ──
     "بيرفيوم":"edp","بيرفيومز":"edp","بارفيومز":"edp","برفان":"edp",
     "پارفيوم":"edp","پرفيوم":"edp","بارفيم":"edp",
-    "تواليت":"edt","تواليتة":"edt","طواليت":"edt",
+    "تواليتة":"edt","طواليت":"edt",
     "اكسترايت":"extrait","اكستريت":"extrait","اكسترييت":"extrait",
     "انتينس":"intense","انتانس":"intense","إنتنس":"intense",
     # ── تهجئات الماركات الإضافية ──
@@ -105,8 +108,8 @@ _SYN = {
     "اسنشال":"essential","ايسنشال":"essential","ايسينشال":"essential",
     "سولييل":"soleil","سولايل":"soleil","سوليل":"soleil",
     "فلورال":"floral","فلورل":"floral","فلوريل":"floral",
-    "سوفاج":"sauvage","سوفايج":"sauvage","سافاج":"sauvage",
-    "بلو":"bleu","بلوو":"bleu",
+    "سوفايج":"sauvage","سافاج":"sauvage",
+    "بلوو":"bleu",
     "ليبر":"libre","ليبرة":"libre",
     "اوريجينال":"original","أوريجينال":"original",
     "إكسترا":"extra","اكسترا":"extra",
@@ -139,7 +142,7 @@ _SYN = {
     "٥٠":"50","٧٥":"75","١٠٠":"100","١٢٥":"125","١٥٠":"150","٢٠٠":"200",
     "٢٥٠":"250","٣٠٠":"300","٣٠":"30","٨٠":"80",
     # تركيزات إضافية
-    "بارفيوم انتنس":"edp intense","انتنس":"intense","إنتنس":"intense",
+    "بارفيوم انتنس":"edp intense","انتنس":"intense",
     "ابسولو":"absolue","ابسوليو":"absolue","ابسوليوت":"absolute",
     "اكستريم":"extreme","اكسترييم":"extreme",
     "بريفيه":"prive","بريفي":"prive","privee":"prive","privé":"prive",
@@ -165,12 +168,12 @@ _SYN = {
     "اد هاردي":"ed hardy","ايد هاردي":"ed hardy",
     # كلمات عطرية شائعة
     "عنبر":"amber","عنبري":"amber","امبر":"amber",
-    "عود":"oud","عودي":"oud",
-    "مسك":"musk","مسكي":"musk",
+    "عودي":"oud",
+    "مسكي":"musk",
     "زعفران":"saffron","زعفراني":"saffron",
     "بخور":"incense","بخوري":"incense",
     "فانيلا":"vanilla","فانيليا":"vanilla",
-    "باتشولي":"patchouli","باتشولي":"patchouli",
+    "باتشولي":"patchouli",
     "صندل":"sandalwood","صندلي":"sandalwood",
     "توباكو":"tobacco","تبغ":"tobacco",
     # تصحيح إملائي شائع
@@ -193,8 +196,12 @@ _NOISE_RE = re.compile(
     , re.UNICODE | re.IGNORECASE
 )
 
+_VOL_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:ml|مل|ملي)",
+    re.IGNORECASE,
+)
 _CAP_VOL_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?)\s*(ml|milliliter|millilitres?|oz|ounce|ounces|مل|ملي)",
+    r"(\d+(?:\.\d+)?)\s*(ml|milliliter|millilitres?|oz|ounce|ounces|مل|ملي)",
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -202,4 +209,18 @@ _BUNDLE_KW_RE = re.compile(
     r"(?:طقم|مجموعة|بكج|باكج|gift\s*set|طقم\s*هدايا|\bset\b|\bbundle\b|\bkit\b)",
     re.IGNORECASE | re.UNICODE,
 )
+
+
+def normalize_match_rule_text(text: str) -> str:
+    """تطبيع نص للمطابقة — يُدار الهمزات والمرادفات عبر _SYN."""
+    if not text:
+        return ""
+    try:
+        t = str(text).strip().lower()
+        for k, v in _SYN.items():
+            t = t.replace(k, v)
+        return t
+    except Exception as e:
+        logger.error("Match rules execution failed: %s", e, exc_info=True)
+        return ""
 

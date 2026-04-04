@@ -138,31 +138,8 @@ class VectorMatcher:
         _ = top_k
         await asyncio.sleep(0.002)
 
-        mock_candidates = [
-            {
-                "sku": "MAH-101",
-                "name": "Carolina Herrera 212 VIP EDP 80ml",
-                "price": 400.0,
-                "is_tester": False,
-                "concentration": "EDP",
-                "size_ml": 80,
-            }
-        ]
-
-        valid_matches: List[Dict[str, Any]] = []
-        for cand in mock_candidates:
-            if cand["is_tester"] != competitor_dna["is_tester"]:
-                continue
-            if cand["concentration"] and competitor_dna["concentration"]:
-                if cand["concentration"] != competitor_dna["concentration"]:
-                    continue
-            if cand["size_ml"] and competitor_dna["size_ml"]:
-                if abs(cand["size_ml"] - competitor_dna["size_ml"]) > 15:
-                    continue
-
-            valid_matches.append({**cand, "confidence": 0.95})
-
-        return valid_matches
+        # تم إزالة البيانات الوهمية (Mock) لمنع تلوث قاعدة البيانات (AI Poisoning)
+        return []
 
 
 class TriageRouter:
@@ -237,7 +214,7 @@ class AsyncHyperScraper:
 
                 data = json_loads(txt)
             except ImportError:
-                pass
+                logger.debug("utils.jsonfast not available; using stdlib json", exc_info=True)
             except (ValueError, json.JSONDecodeError, TypeError):
                 data = None
             if data is None:

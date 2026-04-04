@@ -202,7 +202,6 @@ def auto_assign_category(
         pool = sub_rows if sub_rows else all_rows
         if not pool:
             return out
-        names = [p["name"] for p in pool]
         q = f"{brand} {product_name}".strip() or product_name
         best = None
         best_sc = 0.0
@@ -217,8 +216,8 @@ def auto_assign_category(
             out["method"] = "fuzzy_local"
             out["score"] = best_sc
         return out
-    except Exception:
-        logger.exception("auto_assign_category failed")
+    except Exception as e:
+        logger.error("auto_assign_category failed: %s", e, exc_info=True)
         return out
 
 
@@ -230,7 +229,10 @@ def _parse_category_assign_json(txt: str) -> Optional[dict]:
     try:
         clean = _clean_ai_json(txt)
         return json.loads(clean)
-    except Exception:
+    except Exception as e:
+        logger.error(
+            "auto_assign_category JSON parse failed: %s", e, exc_info=True
+        )
         return None
 
 
@@ -323,22 +325,21 @@ def auto_assign_category_batch(
             except Exception:
                 logger.exception("auto_assign_category_batch API phase failed")
 
-        for col, series in [
-            ("category_auto_path", paths),
-            ("category_auto_name", names),
-            ("category_auto_method", methods),
-            ("category_auto_score", scores),
-        ]:
-            out[col] = series
+        # استخدام assign لضمان ذرية التعديل ومنع SettingWithCopyWarning
+        out = out.assign(
+            category_auto_path=paths,
+            category_auto_name=names,
+            category_auto_method=methods,
+            category_auto_score=scores,
+        )
 
-        # توحيد مع تصنيف_مرجعي إن وُجد
+        # توحيد مع تصنيف_مرجعي إن وُجد بشكل آمن
         if "تصنيف_مرجعي" not in out.columns:
-            out["تصنيف_مرجعي"] = out["category_auto_path"]
+            out = out.assign(تصنيف_مرجعي=out["category_auto_path"])
         else:
-            out["تصنيف_مرجعي"] = out["تصنيف_مرجعي"].where(
-                out["تصنيف_مرجعي"].astype(str).str.strip() != "",
-                out["category_auto_path"],
-            )
+            mask = out["تصنيف_مرجعي"].astype(str).str.strip() != ""
+            out.loc[~mask, "تصنيف_مرجعي"] = out.loc[~mask, "category_auto_path"]
+
         return out
     except Exception:
         logger.exception("auto_assign_category_batch failed")
@@ -511,16 +512,18 @@ def load_brands_categories_from_disk() -> tuple[pd.DataFrame, pd.DataFrame]:
     cdf = pd.DataFrame()
     try:
         bdf = pd.read_csv(BRANDS_CSV, encoding="utf-8-sig", on_bad_lines="skip")
-    except Exception:
+    except Exception as e:
+        logger.debug("brands.csv utf-8-sig read failed: %s", e, exc_info=True)
         try:
             bdf = pd.read_csv(BRANDS_CSV, encoding="utf-8", on_bad_lines="skip")
-        except Exception:
-            pass
+        except Exception as e2:
+            logger.error("brands.csv read failed (utf-8 fallback): %s", e2, exc_info=True)
     try:
         cdf = pd.read_csv(CATEGORIES_CSV, encoding="utf-8-sig", on_bad_lines="skip")
-    except Exception:
+    except Exception as e:
+        logger.debug("categories.csv utf-8-sig read failed: %s", e, exc_info=True)
         try:
             cdf = pd.read_csv(CATEGORIES_CSV, encoding="utf-8", on_bad_lines="skip")
-        except Exception:
-            pass
+        except Exception as e2:
+            logger.error("categories.csv read failed (utf-8 fallback): %s", e2, exc_info=True)
     return bdf, cdf
