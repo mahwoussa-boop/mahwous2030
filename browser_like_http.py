@@ -14,14 +14,21 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import random
 import time
+import threading
 from contextlib import asynccontextmanager, contextmanager
+
+# قفل التزامن الإلزامي لمنع قنبلة متصفحات Playwright (Fork Bomb)
+_PW_LOCK = threading.Lock()
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_int_env(name: str, default: int) -> int:
@@ -57,6 +64,7 @@ def curl_cffi_available() -> bool:
 
         return True
     except ImportError:
+        logger.debug("curl_cffi not installed; using requests fallback", exc_info=True)
         return False
 
 
@@ -106,13 +114,25 @@ def curl_cffi_safe_session(curl_requests_module) -> Any:
     imp = _IMPERSONATE
     try:
         return curl_requests_module.Session(impersonate=imp)
-    except Exception:
+    except Exception as e:
+        logger.debug(
+            "curl_cffi Session impersonate=%r failed; trying fallbacks: %s",
+            imp,
+            e,
+            exc_info=True,
+        )
         for fallback in ("chrome124", "chrome120", "safari17_0"):
             if fallback == imp:
                 continue
             try:
                 return curl_requests_module.Session(impersonate=fallback)
-            except Exception:
+            except Exception as fe:
+                logger.debug(
+                    "curl_cffi Session fallback impersonate=%r failed: %s",
+                    fallback,
+                    fe,
+                    exc_info=True,
+                )
                 continue
         return curl_requests_module.Session()
 
@@ -127,8 +147,10 @@ def create_scraper_session() -> Any:
             if h is not None and not h.get("Accept-Language"):
                 h["Accept-Language"] = "ar,en-US;q=0.9,en;q=0.8"
             return s
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "create_browser_tls_session failed; using plain requests: %s", e, exc_info=True
+            )
     return create_requests_session()
 
 
@@ -166,7 +188,14 @@ def fetch_url_bytes(
             if max_body_bytes is not None and len(raw) > max_body_bytes:
                 raw = raw[:max_body_bytes]
             return 200, raw, saw_block
-        except Exception:
+        except Exception as e:
+            logger.debug(
+                "fetch_url_bytes attempt %s/%s failed url=%s",
+                attempt + 1,
+                max_attempts,
+                url[:220],
+                exc_info=True,
+            )
             saw_block = True
             if attempt + 1 < max_attempts:
                 backoff = (2**attempt) * 2.0 + random.uniform(0.5, 2.0)
@@ -191,33 +220,42 @@ def playwright_browser_context(origin: str, warmup_url: str | None = None):
     if not warm.startswith("http"):
         warm = origin + "/"
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            locale="ar-SA",
-            viewport={"width": 1280, "height": 900},
-            user_agent=random.choice(_USER_AGENTS),
-            extra_http_headers={
-                "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-                "Upgrade-Insecure-Requests": "1",
-            },
-        )
-        page = context.new_page()
-        # domcontentloaded أقل عرضة للتعلّق من wait=load خلف طلبات طرف ثالث / Cloudflare
-        try:
-            page.goto(warm, wait_until="domcontentloaded", timeout=90000)
-        except Exception:
-            page.goto(warm, wait_until="commit", timeout=45000)
-        settle = max(_PW_SETTLE_MS, 3500)
-        page.wait_for_timeout(settle)
-        req = context.request
-        try:
-            yield req, page
-        finally:
-            browser.close()
+    with _PW_LOCK:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--headless=new",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = browser.new_context(
+                locale="ar-SA",
+                viewport={"width": 1280, "height": 900},
+                user_agent=random.choice(_USER_AGENTS),
+                extra_http_headers={
+                    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+            )
+            page = context.new_page()
+            # domcontentloaded أقل عرضة للتعلّق من wait=load خلف طلبات طرف ثالث / Cloudflare
+            try:
+                page.goto(warm, wait_until="domcontentloaded", timeout=90000)
+            except Exception:
+                logger.debug(
+                    "playwright warmup domcontentloaded failed; retry commit warm=%s",
+                    warm[:220],
+                    exc_info=True,
+                )
+                page.goto(warm, wait_until="commit", timeout=45000)
+            settle = max(_PW_SETTLE_MS, 3500)
+            page.wait_for_timeout(settle)
+            req = context.request
+            try:
+                yield req, page
+            finally:
+                browser.close()
 
 
 def playwright_fetch_bytes(url: str, max_bytes: int, timeout_ms: float = 90000) -> tuple[int, bytes]:
@@ -232,7 +270,10 @@ def playwright_fetch_bytes(url: str, max_bytes: int, timeout_ms: float = 90000) 
                 req, url, max_bytes, page=page, timeout_ms=timeout_ms
             )
             return st, data
-    except Exception:
+    except Exception as e:
+        logger.error(
+            "playwright_fetch_bytes failed url=%s", url[:220], exc_info=True
+        )
         return 0, b""
 
 
@@ -274,8 +315,12 @@ def playwright_sub_fetch(
                         b2 = nav.body()
                         if b2:
                             return 200, _clip(b2), saw_block
-                except Exception:
-                    pass
+                except Exception as nav_e:
+                    logger.debug(
+                        "playwright_sub_fetch page.goto fallback failed url=%s",
+                        url[:220],
+                        exc_info=True,
+                    )
             if last_code in (429, 403, 503):
                 saw_block = True
                 if attempt + 1 < max_attempts:
@@ -284,7 +329,14 @@ def playwright_sub_fetch(
                 continue
             if last_code != 200:
                 return last_code, b"", saw_block
-        except Exception:
+        except Exception as loop_e:
+            logger.debug(
+                "playwright_sub_fetch attempt %s/%s failed url=%s",
+                attempt + 1,
+                max_attempts,
+                url[:220],
+                exc_info=True,
+            )
             saw_block = True
             if attempt + 1 < max_attempts:
                 backoff = (2**attempt) * 2.0 + random.uniform(1.0, 2.0)
@@ -307,6 +359,7 @@ def curl_cffi_async_available() -> bool:
 
         return True
     except ImportError:
+        logger.debug("curl_cffi AsyncSession unavailable", exc_info=True)
         return False
 
 
@@ -322,7 +375,7 @@ async def _maybe_await_close(obj: Any) -> None:
             if asyncio.iscoroutine(out):
                 await out
     except Exception:
-        pass
+        logger.debug("_maybe_await_close failed", exc_info=True)
 
 
 class AsyncScraperHTTP:
@@ -376,7 +429,10 @@ class AsyncScraperHTTP:
                     try:
                         session = AsyncSession(impersonate=cand)
                         break
-                    except Exception:
+                    except Exception as se:
+                        logger.debug(
+                            "AsyncSession impersonate=%r failed: %s", cand, se, exc_info=True
+                        )
                         continue
                 if session is not None:
                     aenter = getattr(session, "__aenter__", None)
@@ -384,7 +440,8 @@ class AsyncScraperHTTP:
                         await aenter()
                         self._curl_entered = True
                     self._curl = session
-            except Exception:
+            except Exception as e:
+                logger.warning("curl_cffi AsyncSession setup failed; httpx only: %s", e, exc_info=True)
                 self._curl = None
         return self
 
@@ -416,14 +473,14 @@ class AsyncScraperHTTP:
                 else:
                     await _maybe_await_close(self._curl)
             except Exception:
-                pass
+                logger.debug("AsyncScraperHTTP curl __aexit__/close failed", exc_info=True)
             self._curl = None
 
         if self._httpx is not None:
             try:
                 await self._httpx.__aexit__(exc_type, exc, tb)
             except Exception:
-                pass
+                logger.debug("AsyncScraperHTTP httpx __aexit__ failed", exc_info=True)
             self._httpx = None
 
     async def get_text_once(self, url: str, timeout: float = 25.0) -> tuple[int, str | None]:
@@ -449,8 +506,10 @@ class AsyncScraperHTTP:
                     else:
                         body = str(raw)
                 return code, (body if body else None)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "AsyncScraperHTTP curl get failed url=%s: %s", url[:220], e, exc_info=True
+                )
         try:
             kw: dict[str, Any] = {"timeout": t}
             if extra_h:
@@ -461,7 +520,10 @@ class AsyncScraperHTTP:
             code = int(r.status_code)
             body = r.text or ""
             return code, (body if body else None)
-        except Exception:
+        except Exception as e:
+            logger.debug(
+                "AsyncScraperHTTP httpx get failed url=%s: %s", url[:220], e, exc_info=True
+            )
             return 0, None
 
 

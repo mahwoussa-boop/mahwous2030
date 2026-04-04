@@ -21,12 +21,14 @@ import pandas as pd
 import requests
 import streamlit as st
 
+_MODULE_LOG = logging.getLogger(__name__)
+
 try:
     from dotenv import load_dotenv
 
     load_dotenv()
 except ImportError:
-    pass
+    _MODULE_LOG.debug("python-dotenv not installed; skipping load_dotenv", exc_info=True)
 
 from legacy_core import (
     SALLA_SEO_COLS,
@@ -121,8 +123,10 @@ def _get_secret(*keys: str) -> str:
                 v = sec[k]
                 if v is not None and str(v).strip():
                     return str(v).strip()
-        except Exception:
-            pass
+        except Exception as e:
+            _MODULE_LOG.debug(
+                "st.secrets lookup failed for key=%r: %s", k, e, exc_info=True
+            )
         v = os.environ.get(k, "")
         if v and str(v).strip():
             return str(v).strip()
@@ -132,7 +136,8 @@ def _get_secret(*keys: str) -> str:
 def _effective_anthropic_api_key() -> str:
     try:
         k = str(st.session_state.get("api_key", "") or "").strip()
-    except Exception:
+    except Exception as e:
+        _MODULE_LOG.debug("session_state api_key read failed: %s", e, exc_info=True)
         k = ""
     if k:
         return k
@@ -155,8 +160,8 @@ def configure_app_logging() -> logging.Logger:
             "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
         ))
         log.addHandler(fh)
-    except OSError:
-        pass
+    except OSError as e:
+        _MODULE_LOG.warning("legacy app file log handler failed: %s", e, exc_info=True)
     sh = logging.StreamHandler()
     sh.setLevel(logging.WARNING)
     sh.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
@@ -500,15 +505,15 @@ def _legacy_init_state():
         if os.path.exists(p):
             try:
                 st.session_state.brands_df = pd.read_csv(p, encoding="utf-8-sig")
-            except Exception:
-                pass
+            except Exception as e:
+                APP_LOG.error("brands_df load failed path=%s: %s", p, e, exc_info=True)
     if st.session_state.categories_df is None:
         p = os.path.join(DATA_DIR, "categories.csv")
         if os.path.exists(p):
             try:
                 st.session_state.categories_df = pd.read_csv(p, encoding="utf-8-sig")
-            except Exception:
-                pass
+            except Exception as e:
+                APP_LOG.error("categories_df load failed path=%s: %s", p, e, exc_info=True)
 
 
 def _find_header_row_index(raw: pd.DataFrame, salla_2row: bool) -> int:
@@ -889,8 +894,8 @@ def generate_new_brand(brand_name: str) -> dict:
                 formatted_name = data.get("formatted_name", brand_name)
                 en_name = data.get("en_name", brand_name)
                 desc = data.get("desc", desc)
-        except Exception:
-            pass
+        except Exception as e:
+            APP_LOG.warning("generate_new_brand anthropic failed: %s", e, exc_info=True)
     slug = to_slug(en_name)
     display_name = formatted_name.split("|")[0].strip() if "|" in formatted_name else formatted_name
     out = {
@@ -984,8 +989,8 @@ def run_smart_comparison(
             if HAS_RAPIDFUZZ:
                 try:
                     sc = max(sc, float(rf_fuzz.token_sort_ratio(new_name, sn)))
-                except Exception:
-                    pass
+                except Exception as e:
+                    APP_LOG.debug("rapidfuzz token_sort_ratio failed: %s", e, exc_info=True)
             if sc > best_score:
                 best_score = sc
                 best_store_name = sn
@@ -1276,7 +1281,8 @@ def fetch_image(name: str, tester: bool = False) -> str:
         )
         items = r.json().get("items", [])
         return items[0]["link"] if items else ""
-    except Exception:
+    except Exception as e:
+        APP_LOG.warning("google custom search image fetch failed: %s", e, exc_info=True)
         return ""
 
 
@@ -1302,8 +1308,8 @@ def _ai_fetch_notes_only(name: str, brand_name: str, api_key: str) -> dict:
         parsed = _parse_json_object_from_llm_text(raw, context="ai_fetch_notes_only")
         if parsed:
             return parsed
-    except Exception:
-        pass
+    except Exception as e:
+        APP_LOG.warning("_ai_fetch_notes_only failed: %s", e, exc_info=True)
     return {"top": "غير متوفر", "heart": "غير متوفر", "base": "غير متوفر",
             "family": "غير متوفر", "year": "غير معروف"}
 
@@ -1502,7 +1508,8 @@ def generate_seo_data_ai(product_name: str, missing_fields: list[str]) -> dict:
             if "meta_description" in out:
                 out["meta_description"] = d_lim
         return out
-    except Exception:
+    except Exception as e:
+        APP_LOG.error("seo enrichment block failed: %s", e, exc_info=True)
         return empty_out
 
 
@@ -1780,8 +1787,8 @@ def render_compare_tab():
                             store_img_u = str(sm.iloc[0].get(s_img_col, "") or "").split(",")[0].strip().replace(" ", "%20")
                             if not store_img_u.startswith("http"):
                                 store_img_u = ""
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        APP_LOG.debug("store image lookup failed: %s", e, exc_info=True)
 
                 ph = "width:120px;height:120px;background:#eee;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:2rem"
                 img_new = f'<img src="{new_img_u}" style="width:120px;height:120px;object-fit:cover;border-radius:10px" onerror="this.style.display=\'none\'">' if new_img_u else f'<div style="{ph}">🖼</div>'

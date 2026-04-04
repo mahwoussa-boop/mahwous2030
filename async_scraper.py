@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import queue
+import tempfile
 import random
 import re
 import threading
@@ -34,7 +35,7 @@ try:
     if _sys.platform != "win32":
         import uvloop  # noqa: F401 — اختياري، يُستورد للتحقق من التثبيت
 except ImportError:
-    pass
+    logger.debug("uvloop not installed or unavailable; using default asyncio loop", exc_info=True)
 
 
 def _is_ld_product_group_node(node: dict) -> bool:
@@ -209,14 +210,27 @@ def read_scraper_bg_state() -> dict[str, Any]:
         return dict(default)
 
 
+# قفل تزامن إلزامي لمنع تعارض الخيوط أثناء دمج الحالة (Race Condition)
+_BG_STATE_LOCK = threading.Lock()
+
+
 def merge_scraper_bg_state(**kwargs) -> None:
-    cur = read_scraper_bg_state()
-    cur.update(kwargs)
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = SCRAPER_BG_STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json_dump(cur, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, SCRAPER_BG_STATE_PATH)
+    with _BG_STATE_LOCK:
+        cur = read_scraper_bg_state()
+        cur.update(kwargs)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json_dump(cur, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, SCRAPER_BG_STATE_PATH)
+        except Exception:
+            try:
+                if os.path.isfile(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                logger.debug("merge_scraper_bg_state: tmp cleanup failed", exc_info=True)
+            raise
 
 
 def _random_ua() -> str:
@@ -252,10 +266,17 @@ def _parse_price_float(raw: Any) -> float | None:
     s = re.sub(r"[^\d,.\-]", "", s)
     if not s:
         return None
-    if "," in s and "." in s:
-        s = s.replace(",", "")
-    elif "," in s and "." not in s:
+    last_comma = s.rfind(",")
+    last_dot = s.rfind(".")
+    if last_comma > last_dot and last_dot != -1:
+        # European: 1.200,50 → 1200.50
+        s = s.replace(".", "").replace(",", ".")
+    elif last_comma != -1 and last_dot == -1:
+        # European بدون فاصل آلاف: 1200,50
         s = s.replace(",", ".")
+    else:
+        # US/UK: 1,200.50
+        s = s.replace(",", "")
     try:
         return float(s)
     except ValueError:
@@ -292,7 +313,13 @@ def _same_store_domain(seed_host: str, page_url: str) -> bool:
     """قبول www/subdomain لنفس المتجر ورفض التحويلات لخارج النطاق."""
     try:
         h = (urlparse(page_url).hostname or "").lower()
-    except Exception:
+    except Exception as e:
+        logger.debug(
+            "_same_store_domain urlparse failed page_url=%s: %s",
+            (page_url or "")[:200],
+            e,
+            exc_info=True,
+        )
         return False
     if not h:
         return False
@@ -321,7 +348,12 @@ async def _async_http_get_armored(
             code, text = await fetcher.get_text_once(url, timeout=timeout)
             last_status = int(code or 0)
             _RECENT_HTTP_STATUS.append(last_status)
-            if last_status in (429, 403, 503, 502, 500, 504):
+            if last_status == 429:
+                logger.critical(
+                    "IP Blocked (429). Stopping scraper phase to prevent infinite thread hang."
+                )
+                return None
+            if last_status in (403, 503, 502, 500, 504):
                 await _async_backoff_sleep(attempt)
                 continue
             if last_status == 200 and text:
@@ -445,9 +477,12 @@ async def _expand_sitemap_to_page_urls_async(
             continue
         locs, is_index = _parse_sitemap_xml(raw)
         if is_index:
+            # تحويل الطابور إلى Set للبحث السريع وتفادي التعقيد الزمني O(N)
+            q_set = set(q)
             for loc in locs:
-                if loc.startswith("http") and loc not in seen_sm:
+                if loc.startswith("http") and loc not in seen_sm and loc not in q_set:
                     q.append(loc)
+                    q_set.add(loc)
         else:
             for loc in locs:
                 if loc.startswith("http"):
@@ -872,7 +907,10 @@ def get_checkpoint_recovery_status() -> dict[str, Any]:
             raw = d.get("rows", [])
             raw_rows = raw if isinstance(raw, list) else []
             fp_match = bool(seeds_fp) and (ck_fp == seeds_fp)
-        except Exception:
+        except Exception as e:
+            logger.exception(
+                "get_checkpoint_recovery_status: failed to read %s: %s", CHECKPOINT_JSON, e
+            )
             raw_rows = []
     usable = (
         [r for r in raw_rows if isinstance(r, dict)]
@@ -913,7 +951,9 @@ def write_competitors_csv(rows: list[dict[str, Any]]) -> None:
         return
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(OUT_CSV, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=_COMP_CSV_FIELDS)
+        w = csv.DictWriter(
+            f, fieldnames=_COMP_CSV_FIELDS, extrasaction="ignore"
+        )
         w.writeheader()
         w.writerows(rows)
 
@@ -921,22 +961,30 @@ def write_competitors_csv(rows: list[dict[str, Any]]) -> None:
 def _save_checkpoint(seeds_fp: str, processed: set[str], rows: list[dict[str, Any]]) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     try:
-        with open(CHECKPOINT_JSON, "w", encoding="utf-8") as f:
-            json_dump(
-                {
-                    "seeds_fp": seeds_fp,
-                    "processed_urls": list(processed),
-                    "rows": rows,
-                    "updated_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
-                },
-                f,
-                ensure_ascii=False,
-            )
+        payload = {
+            "seeds_fp": seeds_fp,
+            "processed_urls": list(processed),
+            "rows": rows,
+            "updated_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json_dump(payload, f, ensure_ascii=False)
+            os.replace(tmp_path, CHECKPOINT_JSON)
+        except Exception:
+            try:
+                if os.path.isfile(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                logger.debug("_save_checkpoint: tmp cleanup failed", exc_info=True)
+            raise
         if rows:
             with open(CHECKPOINT_CSV, "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.DictWriter(
                     f,
                     fieldnames=["اسم المنتج", "السعر", "رقم المنتج", "رابط_الصورة"],
+                    extrasaction="ignore",
                 )
                 w.writeheader()
                 w.writerows(rows)
@@ -1232,6 +1280,17 @@ async def _run_scraper_async(
             )
             pipeline_thread.start()
 
+            # حقن سياق Streamlit إجبارياً لمنع انهيار Missing ReportContext في الخيط الخلفي
+            try:
+                from streamlit.runtime.scriptrunner import add_script_run_ctx
+
+                add_script_run_ctx(pipeline_thread)
+            except Exception:
+                logger.error(
+                    "add_script_run_ctx failed for pipeline_thread (Streamlit context)",
+                    exc_info=True,
+                )
+
         inc_cb = pipeline.get("on_incremental_flush") if pipeline else None
         inc_ev = 0
         if pipeline and pipeline.get("incremental_every") is not None:
@@ -1448,7 +1507,18 @@ async def _run_scraper_async(
                             if not tt.done():
                                 tt.cancel()
                         if active:
-                            await asyncio.gather(*active, return_exceptions=True)
+                            _cancel_results = await asyncio.gather(
+                                *active, return_exceptions=True
+                            )
+                            for r in _cancel_results:
+                                if isinstance(r, Exception) and not isinstance(
+                                    r, asyncio.CancelledError
+                                ):
+                                    logger.error(
+                                        "Async task failed (cancel gather): %s",
+                                        r,
+                                        exc_info=(type(r), r, r.__traceback__),
+                                    )
                         active.clear()
                         break
                     for _ in range(n_completed):
@@ -1458,7 +1528,18 @@ async def _run_scraper_async(
                     if not tt.done():
                         tt.cancel()
                 if active:
-                    await asyncio.gather(*active, return_exceptions=True)
+                    _final_gather = await asyncio.gather(
+                        *active, return_exceptions=True
+                    )
+                    for r in _final_gather:
+                        if isinstance(r, Exception) and not isinstance(
+                            r, asyncio.CancelledError
+                        ):
+                            logger.error(
+                                "Async task failed (shutdown gather): %s",
+                                r,
+                                exc_info=(type(r), r, r.__traceback__),
+                            )
 
     if pipeline_q is not None and pipeline_thread is not None:
         _pout = pipeline.setdefault("out", {})
@@ -1512,16 +1593,19 @@ def run_scraper_sync(
     progress_cb=None,
     pipeline: dict[str, Any] | None = None,
 ) -> int:
-    """تشغيل الكشط — يعيد عدد الصفوف المكتوبة. ينفّذ محرك asyncio بالكامل (لا خيط جلب)."""
+    """تشغيل الكشط — يعيد عدد الصفوف المكتوبة. حلقة asyncio معزولة لكل استدعاء (آمن في الخيوط)."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        return asyncio.run(_run_scraper_async(progress_cb, pipeline))
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
+        return loop.run_until_complete(_run_scraper_async(progress_cb, pipeline))
+    except Exception as e:
+        logger.error("Scraper engine crashed: %s", e, exc_info=True)
+        raise
+    finally:
         try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(_run_scraper_async(progress_cb, pipeline))
-        finally:
             loop.close()
+        except Exception:
+            logger.debug("asyncio loop.close failed after run_scraper_sync", exc_info=True)
 
 
 async def run_scraper_engine(progress_cb=None, pipeline: dict[str, Any] | None = None) -> int:

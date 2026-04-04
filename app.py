@@ -13,13 +13,28 @@ app.py - نظام التسعير الذكي مهووس v26.0
 ✅ محرك أتمتة ذكي مع قواعد تسعير قابلة للتخصيص (v26.0)
 ✅ لوحة تحكم الأتمتة متصلة بالتنقل (v26.0)
 """
+import logging
+import os
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # قبل استيراد config أو أي وحدات محلية
+except ImportError:
+    logging.getLogger(__name__).debug(
+        "python-dotenv not installed; skipping load_dotenv", exc_info=True
+    )
+
+from mahwous_logging import configure_logging
+
+configure_logging()
+
 import copy
 import hashlib
+import tempfile
 from html import escape as _html_escape
 from textwrap import dedent as _dedent
 import json
-import logging
-import os
 import pickle
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -109,6 +124,7 @@ from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             safe_float, format_price, format_diff,
                             export_missing_products_to_salla_csv_bytes,
                             make_salla_desc_fn)
+from utils.session_pickle import clean_stale_temp_pickles
 from utils.make_helper import (send_price_updates, send_new_products,
                                 send_missing_products, send_single_product,
                                 verify_webhook_connection, export_to_make_format,
@@ -144,8 +160,10 @@ def _scrape_live_snapshot_min_interval_sec(total_urls: int) -> float:
     if env:
         try:
             return max(0.2, float(env.replace(",", ".")))
-        except ValueError:
-            pass
+        except ValueError as e:
+            _logger.debug(
+                "MAHWOUS_SCRAPE_UI_MIN_INTERVAL_SEC invalid %r: %s", env, e, exc_info=True
+            )
     t = int(total_urls or 0)
     if t > 1200:
         return 1.8
@@ -173,11 +191,14 @@ def _format_elapsed_compact(sec: float | int) -> str:
 
 
 def _missing_df_fingerprint(edf: pd.DataFrame) -> str:
-    """بصمة جدول المفقودات لتتبّع ما إذا تغيّر العرض بعد التجهيز."""
+    """بصمة آمنة لا تستهلك الذاكرة عند التعامل مع 100,000+ صف."""
+    if edf is None or edf.empty:
+        return "0"
     try:
-        return hashlib.sha256(edf.to_csv(index=False).encode("utf-8", errors="replace")).hexdigest()
+        # Hashing only the shape and the first 10 rows to prevent RAM spikes
+        return f"{edf.shape[0]}_{hashlib.md5(str(edf.head(10)).encode()).hexdigest()}"
     except Exception:
-        return str(int(edf.shape[0]))
+        return str(edf.shape[0])
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -197,6 +218,8 @@ try:
     migrate_db_v26()  # v26.0 — ترحيل آمن (idempotent)
 except Exception as e:
     st.error(f"Database Initialization Error: {e}")
+
+clean_stale_temp_pickles(_DATA_DIR)
 
 # ── Session State ─────────────────────────
 _defaults = {
@@ -294,9 +317,10 @@ _REALTIME_RESULTS_LOCK = threading.Lock()
 def _on_realtime_scrape_callback(ev: dict):
     """خُطّاف يُنفَّذ من خيط الكشط الخلفي لكل منتج جديد."""
     try:
-        _REALTIME_EV_QUEUE.put_nowait(ev)
+        # انتظار قصير يقلّل الإسقاط الصامت مقابل put_nowait؛ عند الامتلال نُسجّل ونسقط حدثاً واحداً
+        _REALTIME_EV_QUEUE.put(ev, timeout=2.0)
     except _queue.Full:
-        _logger.warning("realtime scrape event queue full (max 5000); dropping event")
+        _logger.error("Scrape Queue Overload - 1 Event Dropped (UI Thread is too slow)")
 
 # تسجيل الخُطّاف ليقوم السكربر بتغذية الطابور فوراً
 _scrape_event.register_realtime_hook(_on_realtime_scrape_callback)
@@ -331,8 +355,10 @@ def _process_realtime_queue_main_thread():
             try:
                 our_df = pd.read_csv(our_path)
                 st.session_state.our_df = our_df
-            except (OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError):
-                pass
+            except (OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+                _logger.error(
+                    "realtime queue: could not load our catalog from %s", our_path, exc_info=True
+                )
 
     if our_df is None or our_df.empty:
         return
@@ -365,8 +391,11 @@ def _process_realtime_queue_main_thread():
             # محاكاة comp_dfs للمحرك
             comp_dfs = {ev.get("competitor_id", "Competitor"): cdf}
             
-            # تشغيل التحليل الفوري (No-AI أولاً للسرعة)
-            res_df = run_full_analysis(our_df, comp_dfs, use_ai=False)
+            # دفعات ضخمة: لا نشغّل المطابقة الثقيلة في خيط الواجهة (يُكمّل الخلفية/الدفعة لاحقاً)
+            if len(our_df) > 5000:
+                res_df = pd.DataFrame()
+            else:
+                res_df = run_full_analysis(our_df, comp_dfs, use_ai=False)
             
             if not res_df.empty:
                 # تحديث الـ analysis_df في الجلسة
@@ -382,11 +411,10 @@ def _process_realtime_queue_main_thread():
                         if mask.any():
                             continue
                     
-                    new_adf = pd.concat([adf, res_df], ignore_index=True)
-                    st.session_state.analysis_df = new_adf
-                    
-                    # إعادة توزيع الأقسام
-                    r = _split_results(new_adf)
+                    # تقليم الذاكرة لمنع تضخم الجلسة وOOM
+                    capped = pd.concat([adf, res_df], ignore_index=True).tail(2000).copy()
+                    st.session_state.analysis_df = capped
+                    r = _split_results(capped)
                     # الحفاظ على المفقودات الحالية
                     prev_r = st.session_state.get("results") or {}
                     if prev_r.get("missing") is not None:
@@ -409,15 +437,61 @@ def _default_checkpoint_sort() -> dict:
 
 
 def _atomic_write_live_session_pkl(payload: dict) -> None:
-    """كتابة pickle ذرية: ملف مؤقت ثم os.replace حتى لا يقرأ القارئ نصف ملف."""
+    """كتابة pickle ذرية: mkstemp + os.replace حتى لا يقرأ القارئ نصف ملف."""
     os.makedirs(_DATA_DIR, exist_ok=True)
-    tmp = _LIVE_SESSION_PKL + ".tmp"
     with _LIVE_SESSION_PKL_LOCK:
-        with open(tmp, "wb") as f:
+        fd, tmp_path = tempfile.mkstemp(dir=_DATA_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, _LIVE_SESSION_PKL)
+        except Exception:
+            try:
+                if os.path.isfile(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                _logger.debug("cleanup tmp live session pkl failed", exc_info=True)
+            raise
+
+
+def _atomic_write_json_file(path: str, obj, *, indent: int | None = None) -> None:
+    """JSON ذرّي: mkstemp + os.replace."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=indent)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.isfile(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            _logger.debug("cleanup tmp json failed", exc_info=True)
+        raise
+
+
+def _atomic_write_pickle_file(path: str, payload) -> None:
+    """Pickle ذرّي لمسارات الحالة (مثل سياق الكشط الخلفي)."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
             pickle.dump(payload, f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, _LIVE_SESSION_PKL)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.isfile(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            _logger.debug("cleanup tmp pickle failed", exc_info=True)
+        raise
 
 
 def _hydrate_live_session_results_early():
@@ -579,8 +653,8 @@ def _clear_live_session_pkl():
             _tmp = _LIVE_SESSION_PKL + ".tmp"
             if os.path.isfile(_tmp):
                 os.remove(_tmp)
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
 
 
 def _reset_streamlit_after_storage_reset():
@@ -812,8 +886,8 @@ if os.path.isfile(_LIVE_SNAP_PATH):
             _ls = json.load(f)
         if _ls.get("running") and not _ls.get("done"):
             _skip_last_job = True
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-        pass
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        _logger.warning("startup: live snapshot unreadable for job-skip heuristic: %s", e)
 
 if st.session_state.results is None and not st.session_state.job_running and not _skip_last_job:
     _auto_job = get_last_job()
@@ -880,7 +954,8 @@ def _derive_competitor_display_name(user_label: str, store_urls: list[str]) -> s
                 host = host[4:]
             if host:
                 return host[:120]
-        except Exception:
+        except Exception as e:
+            _logger.error(f"Silent failure caught: {e}", exc_info=True)
             continue
     return "Scraped_Competitor"
 
@@ -1042,8 +1117,8 @@ def _comp_incremental_catalog_flush(comp_key: str = "Scraped_Competitor"):
             return
         try:
             upsert_comp_catalog({comp_key: cdf})
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.error(f"Silent failure caught: {e}", exc_info=True)
 
     return _flush
 
@@ -1056,8 +1131,8 @@ def _persist_analysis_after_match(
     processed = total
     try:
         apply_gemini_reclassify_to_analysis_df(analysis_df)
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
     try:
         for _, row in analysis_df.iterrows():
             if safe_float(row.get("نسبة_التطابق", 0)) > 0:
@@ -1070,8 +1145,8 @@ def _persist_analysis_after_match(
                     safe_float(row.get("نسبة_التطابق", 0)),
                     str(row.get("القرار", "")),
                 )
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
     try:
         raw_missing_df = find_missing_products(our_df, comp_dfs)
         missing_df = smart_missing_barrier(raw_missing_df, our_df)
@@ -1262,22 +1337,22 @@ def _live_ui_needs_refresh_ms():
             intervals.append(_ui_autorefresh_interval(2000))
         if (snap.get("checkpoint_sort") or {}).get("active"):
             intervals.append(_ui_autorefresh_interval(2000))
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
     try:
         sbg = read_scraper_bg_state()
         if sbg.get("active"):
             intervals.append(_ui_autorefresh_interval(3000))
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
     try:
         jid = st.session_state.get("job_id")
         if jid:
             job = get_job_progress(jid)
             if job and job.get("status") == "running":
                 intervals.append(_ui_autorefresh_interval(4000))
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
     if not intervals:
         return None
     return min(intervals)
@@ -1295,8 +1370,8 @@ def _trigger_live_ui_refresh_if_needed() -> None:
         return
     try:
         st_autorefresh(interval=ms, key="main_live_refresh")
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
 
 
 def _safe_periodic_rerun(interval_ms: int, key: str) -> None:
@@ -1311,8 +1386,8 @@ def _safe_periodic_rerun(interval_ms: int, key: str) -> None:
     ms = max(1000, min(600_000, int(interval_ms)))
     try:
         st_autorefresh(interval=ms, key=key)
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
 
 
 def _merge_scrape_live_snapshot(**kwargs):
@@ -1341,22 +1416,50 @@ def _merge_scrape_live_snapshot(**kwargs):
             else:
                 cur[k] = v
         cur["updated_at"] = datetime.now().isoformat()
-        os.makedirs(os.path.dirname(SCRAPE_LIVE_SNAPSHOT), exist_ok=True)
-        tmp = SCRAPE_LIVE_SNAPSHOT + ".tmp"
+        snap_dir = os.path.dirname(SCRAPE_LIVE_SNAPSHOT) or "."
+        os.makedirs(snap_dir, exist_ok=True)
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cur, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, SCRAPE_LIVE_SNAPSHOT)
-        except Exception:
-            pass
+            fd, tmp_path = tempfile.mkstemp(dir=snap_dir, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(cur, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, SCRAPE_LIVE_SNAPSHOT)
+            except Exception:
+                try:
+                    if os.path.isfile(tmp_path):
+                        os.unlink(tmp_path)
+                except OSError:
+                    _logger.debug("cleanup tmp after live snapshot write failed", exc_info=True)
+                raise
+        except Exception as e:
+            _logger.error("Live snapshot merge failed: %s", e, exc_info=True)
+            try:
+                emergency = _default_scrape_live_snapshot()
+                emergency["running"] = False
+                emergency["done"] = True
+                emergency["success"] = False
+                prev_err = emergency.get("error")
+                _msg = f"snapshot_write_failed: {e!s}"[:500]
+                emergency["error"] = (
+                    f"{prev_err} | {_msg}" if prev_err else _msg
+                )
+                emergency["updated_at"] = datetime.now().isoformat()
+                fd2, tmp2 = tempfile.mkstemp(dir=snap_dir, suffix=".tmp")
+                with os.fdopen(fd2, "w", encoding="utf-8") as f2:
+                    json.dump(emergency, f2, ensure_ascii=False, indent=2)
+                os.replace(tmp2, SCRAPE_LIVE_SNAPSHOT)
+            except Exception as e2:
+                _logger.error(
+                    "Live snapshot emergency fallback failed: %s", e2, exc_info=True
+                )
 
 
 def _clear_scrape_live_snapshot():
     try:
         if os.path.isfile(SCRAPE_LIVE_SNAPSHOT):
             os.remove(SCRAPE_LIVE_SNAPSHOT)
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
 
 
 def _live_scrape_thread_done(success: bool, error=None):
@@ -1421,8 +1524,8 @@ def _make_on_analysis_snapshot(
     def _cb(rows_snap, analysis_df, is_final):
         try:
             apply_gemini_reclassify_to_analysis_df(analysis_df)
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.error(f"Silent failure caught: {e}", exc_info=True)
         r = _split_results(analysis_df)
         missing_df = pd.DataFrame()
         try:
@@ -1450,8 +1553,8 @@ def _make_on_analysis_snapshot(
                     "updated_at": datetime.now().isoformat(),
                 }
             )
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.error(f"Silent failure caught: {e}", exc_info=True)
         snap = _read_scrape_live_snapshot()
         t = float((snap.get("scrape") or {}).get("total") or 1)
         prog_a = min(1.0, float(len(rows_snap)) / max(t, 1.0))
@@ -1510,9 +1613,20 @@ def _render_live_scrape_dashboard(snap: dict):
             st.metric("⚠️ تحت المراجعة", int(counts.get("review", 0)))
             if int(counts.get("review", 0)) > 0:
                 if st.button("🗑️ حذف النتائج الوهمية", key="del_fake_res_btn", help="تجاهل جميع المنتجات تحت المراجعة دفعة واحدة", use_container_width=True):
-                    mask = st.session_state.analysis_df['suggested_action'] == 'review'
-                    st.session_state.analysis_df.loc[mask, 'status'] = 'ignored'
-                    st.session_state.analysis_df.loc[mask, 'suggested_action'] = 'ignored'
+                    _adf = st.session_state.get("analysis_df")
+                    if _adf is not None and not getattr(_adf, "empty", True) and "القرار" in _adf.columns:
+                        mask = _adf["القرار"].astype(str).str.contains("مراجعة", na=False)
+                        _adf.loc[mask, "القرار"] = "تجاهل"
+                        st.session_state.analysis_df = _adf
+
+                    # إعادة بناء النتائج لتفادي اختفاء قسم المفقودات
+                    prev_r = st.session_state.get("results") or {}
+                    _adf2 = st.session_state.get("analysis_df")
+                    if _adf2 is not None and not getattr(_adf2, "empty", True):
+                        new_r = _split_results(_adf2)
+                        if prev_r.get("missing") is not None:
+                            new_r["missing"] = prev_r["missing"]
+                        st.session_state.results = new_r
                     st.rerun()
     try:
         _pe = int(os.environ.get("SCRAPER_PIPELINE_EVERY", "3") or 3)
@@ -1639,8 +1753,8 @@ def _run_checkpoint_sort_pipeline(
                 )
             else:
                 apply_gemini_reclassify_to_analysis_df(analysis_df)
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.error(f"Silent failure caught: {e}", exc_info=True)
         if emit_progress:
             _merge_scrape_live_snapshot(
                 checkpoint_sort={
@@ -1670,8 +1784,8 @@ def _run_checkpoint_sort_pipeline(
         }
         try:
             _atomic_write_live_session_pkl(payload)
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.error(f"Silent failure caught: {e}", exc_info=True)
         snap = _read_scrape_live_snapshot()
         t = float((snap.get("scrape") or {}).get("total") or 1)
         prog_a = min(1.0, float(n_ck) / max(t, 1.0))
@@ -1775,6 +1889,7 @@ def _start_checkpoint_sort_background(*, log_action: str) -> tuple[bool, str]:
             daemon=True,
             name="checkpoint-sort-bg",
         )
+        add_script_run_ctx(t)
         t.start()
     return True, ""
 
@@ -1879,8 +1994,8 @@ def _run_scrape_chain_background():
         return
     try:
         os.remove(SCRAPE_BG_CONTEXT)
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
 
     scrape_bg = bool(ctx.get("scrape_bg", False))
     our_df = ctx["our_df"]
@@ -1952,8 +2067,7 @@ def _run_scrape_chain_background():
             continue
 
         os.makedirs(_DATA_DIR, exist_ok=True)
-        with open(os.path.join(_DATA_DIR, "competitors_list.json"), "w", encoding="utf-8") as f:
-            json.dump([sm], f, ensure_ascii=False)
+        _atomic_write_json_file(os.path.join(_DATA_DIR, "competitors_list.json"), [sm])
 
         flush_cb = _comp_incremental_catalog_flush(comp_key)
         if pipeline_inline_effective:
@@ -2013,8 +2127,8 @@ def _run_scrape_chain_background():
                     sr = int((_snap_r.get("analysis") or {}).get("scraped_rows") or 0)
                     if elapsed > 2.0 and sr > 0:
                         ppm = (float(sr) / elapsed) * 60.0
-                except Exception:
-                    pass
+                except Exception as e:
+                    _logger.error(f"Silent failure caught: {e}", exc_info=True)
             if need_bg:
                 _last_merge[0] = now
                 merge_scraper_bg_state(
@@ -2080,7 +2194,8 @@ def _run_scrape_chain_background():
 
         try:
             upsert_comp_catalog({comp_key: comp_df})
-        except Exception:
+        except Exception as e:
+            _logger.error(f"Silent failure caught: {e}", exc_info=True)
             continue
 
         stores_completed += 1
@@ -2091,10 +2206,9 @@ def _run_scrape_chain_background():
     try:
         all_smaps = [j.get("sitemap") for j in scrape_queue if j.get("sitemap")]
         if all_smaps:
-            with open(os.path.join(_DATA_DIR, "competitors_list.json"), "w", encoding="utf-8") as f:
-                json.dump(all_smaps, f, ensure_ascii=False)
-    except Exception:
-        pass
+            _atomic_write_json_file(os.path.join(_DATA_DIR, "competitors_list.json"), all_smaps)
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
 
     if stores_completed == 0:
         merge_scraper_bg_state(
@@ -2200,6 +2314,8 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         st.info("لا توجد منتجات")
         return
 
+    _table_salt = uuid.uuid4().hex[:6]
+
     # ── فلاتر ─────────────────────────────────
     opts = _cached_filter_options(df)
     with st.expander("🔍 فلاتر متقدمة", expanded=False):
@@ -2228,7 +2344,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         _exdf = filtered.copy()
         if "جميع المنافسين" in _exdf.columns: _exdf = _exdf.drop(columns=["جميع المنافسين"])
         if "جميع_المنافسين" in _exdf.columns: _exdf = _exdf.drop(columns=["جميع_المنافسين"])
-        excel_data = export_to_excel(_exdf, prefix)
+        excel_data = export_to_excel(_exdf, prefix) or b""
         st.download_button("📥 Excel", data=excel_data,
             file_name=f"{prefix}_{datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2271,7 +2387,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 # v26: سجّل كل منتج في processed_products
                 for _i, (_idx, _r) in enumerate(filtered.iterrows()):
                     _pname = str(_r.get("المنتج", _r.get("منتج_المنافس", "")))
-                    _pkey  = f"{prefix}_{_pname}_{_i}"
+                    _pkey = f"{prefix}_{hashlib.md5(_pname.encode('utf-8')).hexdigest()[:8]}"
                     _pid_r = str(_r.get("معرف_المنتج", _r.get("معرف_المنافس", "")))
                     _comp  = str(_r.get("المنافس",""))
                     _op    = safe_float(_r.get("السعر", _r.get("سعر_المنافس", 0)))
@@ -2343,12 +2459,14 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
     }.get(prefix, "⚠️ تحت المراجعة")
 
     # ── الجدول البصري ─────────────────────
-    # row_i + page_num يضمنان مفاتيح session_state فريدة حتى مع تكرار index في DataFrame
+    # row_i + page_num + safe_idx + _wid + _table_salt — مفاتيح فريدة؛ الإخفاء بـ MD5 الاسم
     for row_i, (idx, row) in enumerate(page_df.iterrows()):
-        price_input_key = f"input_price_{prefix}_p{page_num}_r{row_i}"
-        our_name   = str(row.get("المنتج", "—"))
-        # تخطي المنتجات التي أُرسلت لـ Make أو أُزيلت
-        _hide_key = f"{prefix}_{our_name}_{idx}"
+        safe_idx = str(idx).replace(" ", "_").replace(":", "_")
+        our_name = str(row.get("المنتج", "—"))
+        _wid = str(row.get("sku", row.get("معرف_المنتج", row.get("المنتج", "no_id"))))[:10]
+        _wid = _wid.replace(" ", "_") or "no_id"
+        price_input_key = f"input_price_{prefix}_p{page_num}_r{row_i}_idx{safe_idx}_{_wid}_{_table_salt}"
+        _hide_key = f"{prefix}_{hashlib.md5(our_name.encode('utf-8')).hexdigest()[:8]}"
         if _hide_key in st.session_state.hidden_products:
             continue
         comp_name  = str(row.get("منتج_المنافس", "—"))
@@ -2449,7 +2567,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         with b1:  # AI تحقق ذكي — يُصحح القسم
             _ai_label = {"raise": "🤖 هل نخفض؟", "lower": "🤖 هل نرفع؟",
                          "review": "🤖 هل يطابق؟", "approved": "🤖 تحقق"}.get(prefix, "🤖 تحقق")
-            if st.button(_ai_label, key=f"v_{prefix}_p{page_num}_r{row_i}"):
+            if st.button(_ai_label, key=f"v_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 with st.spinner("🤖 AI يحلل ويتحقق..."):
                     r = verify_match(our_name, comp_name, our_price, comp_price)
                     if r.get("success"):
@@ -2504,7 +2622,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
 
         with b2:  # بحث سعر السوق ذكي
             _mkt_label = {"raise": "🌐 سعر عادل؟", "lower": "🌐 فرصة رفع؟"}.get(prefix, "🌐 سوق")
-            if st.button(_mkt_label, key=f"mkt_{prefix}_p{page_num}_r{row_i}"):
+            if st.button(_mkt_label, key=f"mkt_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 with st.spinner("🌐 يبحث في السوق السعودي..."):
                     r = search_market_price(our_name, our_price)
                     if r.get("success"):
@@ -2540,7 +2658,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                         st.warning("تعذر البحث في السوق")
 
         with b3:  # موافق
-            if st.button("✅ موافق", key=f"ok_{prefix}_p{page_num}_r{row_i}"):
+            if st.button("✅ موافق", key=f"ok_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 st.session_state.decisions_pending[our_name] = {
                     "action": "approved", "reason": "موافقة يدوية",
                     "our_price": our_price, "comp_price": comp_price,
@@ -2549,17 +2667,16 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 }
                 log_decision(our_name, prefix, "approved",
                              "موافقة يدوية", our_price, comp_price, diff, comp_src)
-                _hk3 = f"{prefix}_{our_name}_{idx}"
-                st.session_state.hidden_products.add(_hk3)
-                save_hidden_product(_hk3, our_name, "approved")
-                save_processed(_hk3, our_name, comp_src, "approved",
+                st.session_state.hidden_products.add(_hide_key)
+                save_hidden_product(_hide_key, our_name, "approved")
+                save_processed(_hide_key, our_name, comp_src, "approved",
                                old_price=our_price, new_price=our_price,
                                product_id=str(row.get("معرف_المنتج","")),
                                notes=f"موافق من {prefix} | منافس: {comp_src}")
                 st.rerun()
 
         with b4:  # تأجيل
-            if st.button("⏸️ تأجيل", key=f"df_{prefix}_p{page_num}_r{row_i}"):
+            if st.button("⏸️ تأجيل", key=f"df_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 st.session_state.decisions_pending[our_name] = {
                     "action": "deferred", "reason": "تأجيل",
                     "our_price": our_price, "comp_price": comp_price,
@@ -2571,7 +2688,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 st.warning("⏸️")
 
         with b5:  # إزالة
-            if st.button("🗑️ إزالة", key=f"rm_{prefix}_p{page_num}_r{row_i}"):
+            if st.button("🗑️ إزالة", key=f"rm_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 st.session_state.decisions_pending[our_name] = {
                     "action": "removed", "reason": "إزالة",
                     "our_price": our_price, "comp_price": comp_price,
@@ -2580,10 +2697,9 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 }
                 log_decision(our_name, prefix, "removed",
                              "إزالة", our_price, comp_price, diff, comp_src)
-                _hk = f"{prefix}_{our_name}_{idx}"
-                st.session_state.hidden_products.add(_hk)
-                save_hidden_product(_hk, our_name, "removed")
-                save_processed(_hk, our_name, comp_src, "removed",
+                st.session_state.hidden_products.add(_hide_key)
+                save_hidden_product(_hide_key, our_name, "removed")
+                save_processed(_hide_key, our_name, comp_src, "removed",
                                old_price=our_price, new_price=our_price,
                                product_id=str(row.get("معرف_المنتج","")),
                                notes=f"إزالة من {prefix}")
@@ -2598,7 +2714,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
             )
 
         with b7:  # تصدير Make
-            if st.button("📤 Make", key=f"mk_{prefix}_p{page_num}_r{row_i}"):
+            if st.button("📤 Make", key=f"mk_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 # سحب رقم المنتج من جميع الأعمدة المحتملة
                 _pid_raw = (
                     row.get("معرف_المنتج", "") or
@@ -2628,17 +2744,16 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                     "diff": diff, "decision": decision, "competitor": comp_src
                 })
                 if res["success"]:
-                    _hk = f"{prefix}_{our_name}_{idx}"
-                    st.session_state.hidden_products.add(_hk)
-                    save_hidden_product(_hk, our_name, "sent_to_make")
-                    save_processed(_hk, our_name, comp_src, "send_price",
+                    st.session_state.hidden_products.add(_hide_key)
+                    save_hidden_product(_hide_key, our_name, "sent_to_make")
+                    save_processed(_hide_key, our_name, comp_src, "send_price",
                                    old_price=our_price, new_price=_final_price,
                                    product_id=_pid,
                                    notes=f"Make ← {prefix} | منافس: {comp_src} | {comp_price:.0f}→{_final_price:.0f}ر.س")
                     st.rerun()
 
         with b8:  # تحقق AI — يُصحح القسم
-            if st.button("🔍 تحقق", key=f"vrf_{prefix}_p{page_num}_r{row_i}"):
+            if st.button("🔍 تحقق", key=f"vrf_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 with st.spinner("🤖 يتحقق..."):
                     _vr2 = verify_match(our_name, comp_name, our_price, comp_price)
                     if _vr2.get("success"):
@@ -2651,7 +2766,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                             st.warning(f"يجب نقله → **{_sec2}**")
 
         with b9:  # تاريخ السعر
-            if st.button("📈 تاريخ", key=f"ph_{prefix}_p{page_num}_r{row_i}"):
+            if st.button("📈 تاريخ", key=f"ph_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 history = get_price_history(our_name, comp_src)
                 if history:
                     rows_h = [f"📅 {h['date']}: {h['price']:,.0f} ر.س" for h in history[:5]]
@@ -2660,7 +2775,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                     st.info("لا يوجد تاريخ بعد")
 
         with b10:  # تحليل عميق (سوق + Gemini)
-            if st.button("🔬 عميق", key=f"deep_{prefix}_p{page_num}_r{row_i}"):
+            if st.button("🔬 عميق", key=f"deep_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}"):
                 with st.spinner("🔬 تحليل عميق..."):
                     r_deep = ai_deep_analysis(
                         our_name, our_price, comp_name, comp_price,
@@ -2686,12 +2801,12 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                     "انقل إلى",
                     options=_opts,
                     format_func=lambda k: _lbl.get(k, k),
-                    key=f"redist_pick_{prefix}_p{page_num}_r{row_i}",
+                    key=f"redist_pick_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}",
                     label_visibility="collapsed",
                 )
                 if st.button(
                     "✓ تطبيق إعادة التوزيع",
-                    key=f"redist_apply_{prefix}_p{page_num}_r{row_i}",
+                    key=f"redist_apply_{prefix}_p{page_num}_r{row_i}_{safe_idx}_{_wid}_{_table_salt}",
                 ):
                     _ok_r, _err_r = _apply_redistribute_analysis_row(
                         our_name, comp_name, _pick
@@ -2745,8 +2860,8 @@ with st.sidebar:
         from utils.apify_sync import try_apify_auto_import_sidebar
 
         try_apify_auto_import_sidebar()
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"Silent failure caught: {e}", exc_info=True)
 
     # زر تشخيص سريع
     if not ai_ok:
@@ -2936,8 +3051,8 @@ with st.sidebar:
                         _cdf_done = load_all_comp_catalog_as_comp_dfs()
                         if _cdf_done:
                             st.session_state.comp_dfs = _cdf_done
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _logger.error(f"Silent failure caught: {e}", exc_info=True)
                     _focus_sidebar_on_analysis_results(_r)
                 _sbg_done = read_scraper_bg_state()
                 if _sbg_done.get("job_id") and _sbg_done.get("job_id") == st.session_state.job_id:
@@ -3163,8 +3278,8 @@ if page == "📊 لوحة التحكم":
                         _cdf_last = load_all_comp_catalog_as_comp_dfs()
                         if _cdf_last:
                             st.session_state.comp_dfs = _cdf_last
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _logger.error(f"Silent failure caught: {e}", exc_info=True)
                     _focus_sidebar_on_analysis_results(_r)
                     st.rerun()
         else:
@@ -3429,8 +3544,9 @@ elif page == "📂 رفع الملفات":
                         our_df_pre = our_df_pre.head(int(max_rows))
                     os.makedirs(_DATA_DIR, exist_ok=True)
                     _all_smaps = [p[2] for p in resolved_triples]
-                    with open(os.path.join(_DATA_DIR, "competitors_list.json"), "w", encoding="utf-8") as f:
-                        json.dump(_all_smaps, f, ensure_ascii=False)
+                    _atomic_write_json_file(
+                        os.path.join(_DATA_DIR, "competitors_list.json"), _all_smaps
+                    )
 
                     _comp_label = str(
                         st.session_state.get("competitor_display_name") or ""
@@ -3464,8 +3580,7 @@ elif page == "📂 رفع الملفات":
                         "scrape_queue": _scrape_queue,
                     }
                     try:
-                        with open(SCRAPE_BG_CONTEXT, "wb") as fctx:
-                            pickle.dump(ctx, fctx)
+                        _atomic_write_pickle_file(SCRAPE_BG_CONTEXT, ctx)
                     except Exception as e:
                         st.error(f"❌ تعذر حفظ سياق الكشط: {e}")
                     else:
@@ -3730,7 +3845,7 @@ elif page == "🔍 منتجات مفقودة":
             cc1, cc2, cc3, cc4 = st.columns(4)
             with cc1:
                 if _export_ok:
-                    excel_m = export_to_excel(_export_df, "مفقودة")
+                    excel_m = export_to_excel(_export_df, "مفقودة") or b""
                     st.download_button("📥 Excel", data=excel_m, file_name="missing.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="miss_dl")
                 else:
@@ -3840,9 +3955,10 @@ elif page == "🔍 منتجات مفقودة":
 
             for row_i, (idx, row) in enumerate(page_df.iterrows()):
                 name  = str(row.get("منتج_المنافس", ""))
-                _row_slot = f"miss_p{pn}_r{row_i}"
+                _mh = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
+                _row_slot = f"miss_p{pn}_r{row_i}_{_mh}"
                 miss_price_key = f"input_price_{_row_slot}"
-                _miss_key = f"missing_{name}_{idx}"
+                _miss_key = f"missing_{_mh}"
                 if _miss_key in st.session_state.hidden_products:
                     continue
 
@@ -4066,10 +4182,9 @@ elif page == "🔍 منتجات مفقودة":
                             _wc = len(_desc_send.split()) if _desc_send else 0
                             _wc_msg = f" — وصف {_wc} كلمة" if _wc > 0 else ""
                             st.success(f"✅ {res['message']}{_wc_msg}")
-                            _mk = f"missing_{name}_{idx}"
-                            st.session_state.hidden_products.add(_mk)
-                            save_hidden_product(_mk, name, "sent_to_make")
-                            save_processed(_mk, name, comp, "send_missing",
+                            st.session_state.hidden_products.add(_miss_key)
+                            save_hidden_product(_miss_key, name, "sent_to_make")
+                            save_processed(_miss_key, name, comp, "send_missing",
                                            new_price=_send_price,
                                            notes=f"إضافة جديدة" + (f" + وصف {_wc} كلمة" if _wc > 0 else ""))
                             for k in [f"desc_{_row_slot}", f"frag_info_{_row_slot}", f"desc_edit_{_row_slot}"]:
@@ -4095,10 +4210,9 @@ elif page == "🔍 منتجات مفقودة":
                 with b8:
                     if st.button("🗑️ تجاهل", key=f"ign_{_row_slot}"):
                         log_decision(name,"missing","ignored","تجاهل",0,price,-price,comp)
-                        _ign = f"missing_{name}_{idx}"
-                        st.session_state.hidden_products.add(_ign)
-                        save_hidden_product(_ign, name, "ignored")
-                        save_processed(_ign, name, comp, "ignored",
+                        st.session_state.hidden_products.add(_miss_key)
+                        save_hidden_product(_miss_key, name, "ignored")
+                        save_processed(_miss_key, name, comp, "ignored",
                                        new_price=price,
                                        notes="تجاهل من قسم المفقودة")
                         st.rerun()
@@ -4193,7 +4307,7 @@ elif page == "⚠️ تحت المراجعة":
                         else:
                             st.warning("لم يتمكن AI من إعادة التصنيف")
             with col_r2:
-                excel_rv = export_to_excel(df, "مراجعة")
+                excel_rv = export_to_excel(df, "مراجعة") or b""
                 st.download_button("📥 Excel", data=excel_rv, file_name="review.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rv_dl")
 
@@ -4213,6 +4327,8 @@ elif page == "⚠️ تحت المراجعة":
 
             for idx, row in page_rv.iterrows():
                 our_name   = str(row.get("المنتج",""))
+                _wid = str(row.get("sku", row.get("معرف_المنتج", row.get("المنتج", "no_id"))))[:10]
+                _wid = _wid.replace(" ", "_") or "no_id"
                 comp_name  = str(row.get("منتج_المنافس","—"))
                 our_price  = safe_float(row.get("السعر",0))
                 comp_price = safe_float(row.get("سعر_المنافس",0))
@@ -4224,7 +4340,7 @@ elif page == "⚠️ تحت المراجعة":
                 our_img_rv = str(row.get("صورة_منتجنا", "") or "").strip()
                 comp_img_rv = str(row.get("صورة_المنافس", "") or "").strip()
 
-                _rv_key = f"review_{our_name}_{idx}"
+                _rv_key = f"review_{hashlib.md5(our_name.encode('utf-8')).hexdigest()[:8]}"
                 if _rv_key in st.session_state.hidden_products:
                     continue
 
@@ -4294,7 +4410,7 @@ elif page == "⚠️ تحت المراجعة":
                 ba, bb, bc, bd, be, bf = st.columns(6)
 
                 with ba:
-                    if st.button("🤖 تحقق AI", key=f"rv_verify_{idx}"):
+                    if st.button("🤖 تحقق AI", key=f"rv_verify_{idx}_{_wid}"):
                         with st.spinner("..."):
                             r_v = verify_match(our_name, comp_name, our_price, comp_price)
                             if r_v.get("success"):
@@ -4311,7 +4427,7 @@ elif page == "⚠️ تحت المراجعة":
                                 st.warning("فشل التحقق")
 
                 with bb:
-                    if st.button("✅ موافق", key=f"rv_approve_{idx}"):
+                    if st.button("✅ موافق", key=f"rv_approve_{idx}_{_wid}"):
                         log_decision(our_name,"review","approved","موافق",our_price,comp_price,diff,comp_name_s)
                         st.session_state.hidden_products.add(_rv_key)
                         save_hidden_product(_rv_key, our_name, "approved_from_review")
@@ -4321,7 +4437,7 @@ elif page == "⚠️ تحت المراجعة":
                         st.rerun()
 
                 with bc:
-                    if st.button("🔴 سعر أعلى", key=f"rv_raise_{idx}"):
+                    if st.button("🔴 سعر أعلى", key=f"rv_raise_{idx}_{_wid}"):
                         log_decision(our_name,"review","price_raise","سعر أعلى",our_price,comp_price,diff,comp_name_s)
                         st.session_state.hidden_products.add(_rv_key)
                         save_hidden_product(_rv_key, our_name, "moved_price_raise")
@@ -4331,7 +4447,7 @@ elif page == "⚠️ تحت المراجعة":
                         st.rerun()
 
                 with bd:
-                    if st.button("🔵 مفقود", key=f"rv_missing_{idx}"):
+                    if st.button("🔵 مفقود", key=f"rv_missing_{idx}_{_wid}"):
                         log_decision(our_name,"review","missing","مفقود",our_price,comp_price,diff,comp_name_s)
                         st.session_state.hidden_products.add(_rv_key)
                         save_hidden_product(_rv_key, our_name, "moved_missing")
@@ -4341,7 +4457,7 @@ elif page == "⚠️ تحت المراجعة":
                         st.rerun()
 
                 with be:
-                    if st.button("🗑️ تجاهل", key=f"rv_ign_{idx}"):
+                    if st.button("🗑️ تجاهل", key=f"rv_ign_{idx}_{_wid}"):
                         log_decision(our_name,"review","ignored","تجاهل",our_price,comp_price,diff,comp_name_s)
                         st.session_state.hidden_products.add(_rv_key)
                         save_hidden_product(_rv_key, our_name, "ignored_review")
@@ -4351,7 +4467,7 @@ elif page == "⚠️ تحت المراجعة":
                         st.rerun()
 
                 with bf:
-                    if st.button("🔬 عميق", key=f"rv_deep_{idx}"):
+                    if st.button("🔬 عميق", key=f"rv_deep_{idx}_{_wid}"):
                         with st.spinner("🔬 تحليل عميق..."):
                             r_d = ai_deep_analysis(
                                 our_name, our_price, comp_name, comp_price,
@@ -5068,7 +5184,7 @@ elif page == "⚙️ الإعدادات":
                 "`data/mahwous_catalog.csv` ولا جداول كتالوج المنافسين في قاعدة البيانات."
             )
             _rh = st.checkbox("إظهار المنتجات التي كانت «مخفية» بعد الإرسال", value=True, key="reset_show_hidden")
-            _rm = st.checkbox("حذف كاش المطابقة (match_cache_v21.db)", value=True, key="reset_match_cache")
+            _rm = st.checkbox("حذف كاش المطابقة (data/match_cache_v26.db)", value=True, key="reset_match_cache")
             _rs = st.checkbox("مسح حالة الكاشط ونقاط الحفظ", value=True, key="reset_scraper_state")
             _rlog = st.checkbox(
                 "مسح سجل التحليلات/الأسعار/الأحداث (نفس صفحة 📜 السجل)",

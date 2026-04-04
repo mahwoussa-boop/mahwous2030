@@ -1,8 +1,11 @@
 """
 styles.py - التصميم v20.0 — بطاقات محسنة + عرض المنافسين
 """
+import logging
 from html import escape as _html_escape
 from textwrap import dedent
+
+_logger = logging.getLogger(__name__)
 
 
 def get_styles():
@@ -200,7 +203,12 @@ def comp_strip(all_comps, our_price=None, rank_by_threat=False, show_threat_badg
             from utils.threat_score import rank_competitors_for_ui
 
             sorted_comps = rank_competitors_for_ui(work, float(our_price))
-        except Exception:
+        except Exception as e:
+            _logger.warning(
+                "comp_strip: rank_competitors_for_ui failed; using price sort: %s",
+                e,
+                exc_info=True,
+            )
             sorted_comps = sorted(
                 work, key=lambda c: float(c.get("price", c.get("comp_price", 0)) or 0)
             )

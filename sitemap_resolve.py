@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import traceback
@@ -16,6 +17,8 @@ from browser_like_http import (
     playwright_browser_context,
     playwright_sub_fetch,
 )
+
+logger = logging.getLogger(__name__)
 
 _UserFetch = Callable[[str, int], tuple[int, bytes, bool]]
 
@@ -180,8 +183,8 @@ def _discover_with_fetch(full: str, origin: str, fetch: _UserFetch) -> tuple[str
                     return sm, f"✅ وُجدت خريطة الموقع من robots.txt: {sm}", blocked_any
                 if wall_hit(c2):
                     return None, _CF_MSG, blocked_any
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("robots.txt sitemap discovery failed: %s", e, exc_info=True)
 
     for page_url in (full, urljoin(origin + "/", "/")):
         code, htmlb, bl = fetch(page_url, 262144)

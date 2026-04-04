@@ -21,16 +21,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
 import time
 from urllib.parse import urlparse
 
+_log = logging.getLogger(__name__)
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+except Exception as e:
+    _log.debug("stdout.reconfigure(utf-8) failed: %s", e, exc_info=True)
 
 # -----------------------------------------------------------------------------
 # تبعيات
@@ -52,6 +55,22 @@ try:
     HAS_AIOFILES = True
 except ImportError:
     HAS_AIOFILES = False
+
+
+def build_chrome_options_headless_docker():
+    """
+    إعدادات Chrome لـ undetected-chromedriver / Selenium في Docker (بدون Xvfb).
+    استخدم --headless=new بدل الـ headless القديم لتفادي الانهيار.
+    """
+    try:
+        from selenium.webdriver.chrome.options import Options
+    except ImportError:
+        return None
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    return options
 
 _IMPERSONATE_FALLBACKS = (
     os.environ.get("MAHWOUS_ULTIMATE_IMPERSONATE", "").strip() or "chrome120",
@@ -192,8 +211,8 @@ def extract_salla_product_data(html: str, url: str) -> dict:
             op = _safe_float(re.sub(r"[^\d.]", "", old_el.text))
             if op > 0:
                 product_data["original_price"] = op
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("original_price scrape from DOM failed url=%s: %s", url[:200], e, exc_info=True)
 
     if product_data["original_price"] == 0.0 and product_data["price"] > 0:
         product_data["original_price"] = product_data["price"]

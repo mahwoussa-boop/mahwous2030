@@ -2,9 +2,20 @@
 config.py - الإعدادات المركزية v26.0
 المفاتيح محمية عبر Streamlit Secrets
 """
+import csv
+import io
 import json as _json
+import logging
 import os as _os
 import tempfile
+
+_log = logging.getLogger(__name__)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # حقن المتغيرات البيئية قبل أي قراءة في هذا الملف
+except ImportError:
+    _log.debug("python-dotenv not installed; skipping load_dotenv", exc_info=True)
 
 # جذر المشروع (مجلد config.py) — لا يعتمد على cwd عند streamlit run من مسار آخر
 _APP_ROOT = _os.path.dirname(_os.path.abspath(__file__))
@@ -37,8 +48,12 @@ def _s(key, default=""):
         v = st.secrets[key]
         if v is not None:
             return str(v) if not isinstance(v, (list, dict)) else v
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug(
+            "st.secrets read failed for key=%r (falling back to default)",
+            key,
+            exc_info=True,
+        )
     return default
 
 
@@ -66,10 +81,33 @@ def _parse_gemini_keys():
                 parsed = _json.loads(raw)
                 if isinstance(parsed, list):
                     keys = [k for k in parsed if k]
-            except Exception:
-                # ربما string بدون quotes صحيحة → نظفها
-                clean = raw.strip("[]").replace('"','').replace("'",'')
-                keys = [k.strip() for k in clean.split(',') if k.strip()]
+            except Exception as e:
+                _log.debug(
+                    "GEMINI_API_KEYS JSON parse failed; trying csv/split fallback: %s",
+                    e,
+                    exc_info=True,
+                )
+                # ربما string بدون quotes صحيحة → تحليل آمن للفواصل داخل التنصيص
+                raw_clean = raw.strip("[] \n\r")
+                if raw_clean:
+                    try:
+                        reader = csv.reader(io.StringIO(raw_clean), skipinitialspace=True)
+                        for row in reader:
+                            for k in row:
+                                cleaned_k = k.strip().strip("\"'")
+                                if cleaned_k:
+                                    keys.append(cleaned_k)
+                    except Exception as e:
+                        _log.debug(
+                            "GEMINI_API_KEYS csv reader fallback failed; using split: %s",
+                            e,
+                            exc_info=True,
+                        )
+                        keys = [
+                            k.strip().strip("\"'")
+                            for k in raw_clean.split(",")
+                            if k.strip().strip("\"'")
+                        ]
         elif raw:
             keys = [raw]
 
@@ -158,8 +196,8 @@ def apify_auto_import_state_path() -> str:
     d = _os.path.join(_APP_ROOT, "data")
     try:
         _os.makedirs(d, exist_ok=True)
-    except OSError:
-        pass
+    except OSError as e:
+        _log.warning("could not mkdir for apify state: %s", e, exc_info=True)
     return _os.path.join(d, "apify_auto_import_state.json")
 
 
