@@ -8,63 +8,23 @@ engines/automation.py v26.0 — محرك الأتمتة الذكي الكامل
 ✅ جدولة عمليات بحث دورية
 ✅ حماية ضد القرارات الخاطئة (حدود أمان)
 """
-import concurrent.futures
 import json
-import logging
 import time
 import threading
 import sqlite3
-from collections import deque
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import pandas as pd
-import requests
-
-logger = logging.getLogger(__name__)
-
-_DECISIONS_LOG_MAX = 5000
 
 try:
     from config import (AUTOMATION_RULES_DEFAULT, AUTO_DECISION_CONFIDENCE,
-                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES,
-                        DB_PATH, REVIEW_VERIFY_MIN_CONFIDENCE)
+                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES, DB_PATH)
 except ImportError:
     AUTOMATION_RULES_DEFAULT = []
     AUTO_DECISION_CONFIDENCE = 92
-    REVIEW_VERIFY_MIN_CONFIDENCE = 72
     AUTO_PUSH_TO_MAKE = False
     AUTO_SEARCH_INTERVAL_MINUTES = 360
-    import os
-    import tempfile as _tf
-    DB_PATH = os.path.join(_tf.gettempdir(), "pricing_v18.db")
-
-# أقصى نسبة انخفاض مسموح بها تلقائياً (يمنع «السباق نحو الصفر» عند أخطاء بيانات المنافس)
-MAX_DROP_PCT = 0.25
-_SAFE_DROP_WARNING = (
-    "⚠️ تم إيقاف الخفض: الانخفاض يتجاوز الحد الأقصى للنزول الآمن (25%). يتطلب مراجعة يدوية."
-)
-
-
-def _apply_max_drop_safeguard(decision: Dict) -> Dict:
-    """
-    إذا تجاوزت نسبة الخفض عن سعرنا الحالي MAX_DROP_PCT → لا يُسمح بالدفع التلقائي:
-    يُحوَّل القرار إلى مراجعة ويُعاد السعر المقترح إلى السعر القديم.
-    """
-    if not isinstance(decision, dict):
-        return decision
-    old = float(decision.get("old_price", 0) or 0)
-    new = float(decision.get("new_price", 0) or 0)
-    if old <= 0 or new >= old:
-        return decision
-    drop_pct = (old - new) / old
-    if drop_pct <= MAX_DROP_PCT:
-        return decision
-    out = dict(decision)
-    orig_reason = str(out.get("reason", "")).strip()
-    out["action"] = "review"
-    out["new_price"] = round(old, 2)
-    out["reason"] = (orig_reason + " " if orig_reason else "").strip() + " " + _SAFE_DROP_WARNING
-    return out
+    DB_PATH = "perfume_pricing.db"
 
 
 # ═══════════════════════════════════════════════════════
@@ -137,27 +97,15 @@ class AutomationEngine:
 
     def __init__(self, rules: List[dict] = None):
         self.rules = [PricingRule(r) for r in (rules or AUTOMATION_RULES_DEFAULT)]
-        self.decisions_log: deque = deque(maxlen=_DECISIONS_LOG_MAX)
+        self.decisions_log: List[dict] = []
         self._lock = threading.Lock()
 
     def evaluate_product(self, product_data: dict) -> Optional[Dict]:
         """تقييم منتج واحد ضد كل القواعد"""
-        try:
-            our_price = float(product_data.get("our_price", 0) or 0)
-        except (TypeError, ValueError):
-            our_price = 0.0
-        try:
-            comp_price = float(product_data.get("comp_price", 0) or 0)
-        except (TypeError, ValueError):
-            comp_price = 0.0
-        try:
-            match_score = float(product_data.get("match_score", 0) or 0)
-        except (TypeError, ValueError):
-            match_score = 0.0
-        try:
-            cost_price = float(product_data.get("cost_price", 0) or 0)
-        except (TypeError, ValueError):
-            cost_price = 0.0
+        our_price = float(product_data.get("our_price", 0))
+        comp_price = float(product_data.get("comp_price", 0))
+        match_score = float(product_data.get("match_score", 0))
+        cost_price = float(product_data.get("cost_price", 0))
 
         for rule in self.rules:
             decision = rule.evaluate(our_price, comp_price, match_score, cost_price)
@@ -170,9 +118,8 @@ class AutomationEngine:
                     "match_score": match_score,
                     "timestamp": datetime.now().isoformat(),
                 })
-                decision = _apply_max_drop_safeguard(decision)
                 with self._lock:
-                    self.decisions_log.append(decision)  # deque يحدّ الطول تلقائياً
+                    self.decisions_log.append(decision)
                 return decision
         return None
 
@@ -180,23 +127,11 @@ class AutomationEngine:
         """تقييم دفعة من المنتجات"""
         decisions = []
         for _, row in products_df.iterrows():
-            try:
-                op = float(row.get("السعر", 0) or 0)
-            except (TypeError, ValueError):
-                op = 0.0
-            try:
-                cp = float(row.get("سعر_المنافس", 0) or 0)
-            except (TypeError, ValueError):
-                cp = 0.0
-            try:
-                ms = float(row.get("نسبة_التطابق", 0) or 0)
-            except (TypeError, ValueError):
-                ms = 0.0
             d = self.evaluate_product({
                 "name": str(row.get("المنتج", "")),
-                "our_price": op,
-                "comp_price": cp,
-                "match_score": ms,
+                "our_price": float(row.get("السعر", 0) or 0),
+                "comp_price": float(row.get("سعر_المنافس", 0) or 0),
+                "match_score": float(row.get("نسبة_التطابق", 0) or 0),
                 "product_id": str(row.get("معرف_المنتج", "")),
                 "competitor": str(row.get("المنافس", "")),
             })
@@ -204,9 +139,23 @@ class AutomationEngine:
                 decisions.append(d)
         return decisions
 
-    def get_summary(self, db_path=None) -> Dict:
-        """ملخص من SQLite (WAL) — لا يعتمد على deque الذاكرة."""
-        return get_automation_stats(days=7, db=db_path or DB_PATH)
+    def get_summary(self) -> Dict:
+        """ملخص إحصائي"""
+        with self._lock:
+            log = list(self.decisions_log)
+        if not log:
+            return {"total": 0, "lower": 0, "raise": 0, "keep": 0,
+                    "savings": 0, "gains": 0, "net_impact": 0}
+        lower_c = sum(1 for d in log if d["action"] == "lower_price")
+        raise_c = sum(1 for d in log if d["action"] == "raise_price")
+        keep_c = sum(1 for d in log if d["action"] == "keep_price")
+        savings = sum(d["old_price"] - d["new_price"] for d in log if d["action"] == "lower_price")
+        gains = sum(d["new_price"] - d["old_price"] for d in log if d["action"] == "raise_price")
+        return {
+            "total": len(log), "lower": lower_c, "raise": raise_c, "keep": keep_c,
+            "savings": round(savings, 2), "gains": round(gains, 2),
+            "net_impact": round(gains - savings, 2),
+        }
 
     def clear_log(self):
         with self._lock:
@@ -241,18 +190,11 @@ def auto_push_decisions(decisions: List[Dict]) -> Dict:
 
     try:
         result = send_batch_smart(products, "auto_update")
-        ok = bool(result.get("success"))
-        if ok:
-            for d in eligible:
-                log_automation_decision(d, pushed=True)
-        return {
-            "success": ok,
-            "sent": result.get("sent", 0) if ok else 0,
-            "result": result,
-            "message": result.get("message")
-            if isinstance(result, dict)
-            else (f"تم إرسال {len(products)} تحديث تلقائي" if ok else "فشل الإرسال التلقائي"),
-        }
+        # تسجيل الإرسال
+        for d in eligible:
+            log_automation_decision(d, pushed=True)
+        return {"success": True, "sent": len(products), "result": result,
+                "message": f"تم إرسال {len(products)} تحديث تلقائي"}
     except Exception as e:
         return {"success": False, "sent": 0, "message": f"فشل: {str(e)[:200]}"}
 
@@ -274,12 +216,13 @@ def auto_process_review_items(review_df: pd.DataFrame) -> pd.DataFrame:
             v = verify_match(our_name, comp_name,
                              float(row.get("السعر", 0) or 0),
                              float(row.get("سعر_المنافس", 0) or 0))
-            conf = float(v.get("confidence", 0) or 0)
-            if v.get("match") and conf >= REVIEW_VERIFY_MIN_CONFIDENCE:
-                rd = row.to_dict() if hasattr(row, "to_dict") else dict(row)
-                rd["القرار"] = v.get("ui_decision") or rd.get("القرار", "")
+            if v.get("match") and float(v.get("confidence", 0)) >= AUTO_DECISION_CONFIDENCE:
+                rd = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
+                cs = v.get("correct_section", "")
+                if cs:
+                    rd["القرار"] = cs
                 rd["_auto_verified"] = True
-                rd["_verification_confidence"] = conf
+                rd["_verification_confidence"] = v.get("confidence", 0)
                 confirmed.append(rd)
         except Exception:
             continue
@@ -314,8 +257,8 @@ class ScheduledSearchManager:
         m = int((remaining.total_seconds() % 3600) // 60)
         return f"{h} ساعة و {m} دقيقة"
 
-    def _run_scan_core(self, products_df: pd.DataFrame, top_n: int = 20) -> List[Dict]:
-        """منطق مسح السوق (يُستدعى من worker خيط المنفّذ)."""
+    def run_scan(self, products_df: pd.DataFrame, top_n: int = 20) -> List[Dict]:
+        """مسح السوق لأهم المنتجات"""
         try:
             from engines.ai_engine import search_market_price
         except ImportError:
@@ -329,18 +272,13 @@ class ScheduledSearchManager:
         try:
             results = []
             if "الفرق" in products_df.columns:
-                _abs_col = "__abs_الفرق__"
-                _tmp = products_df.assign(**{_abs_col: products_df["الفرق"].abs()})
-                sorted_df = _tmp.sort_values(_abs_col, ascending=False).drop(columns=[_abs_col]).head(top_n)
+                sorted_df = products_df.sort_values("الفرق", key=abs, ascending=False).head(top_n)
             else:
                 sorted_df = products_df.head(top_n)
 
             for _, row in sorted_df.iterrows():
                 name = str(row.get("المنتج", ""))
-                try:
-                    price = float(row.get("السعر", 0) or 0)
-                except (TypeError, ValueError):
-                    price = 0.0
+                price = float(row.get("السعر", 0) or 0)
                 if not name or price <= 0:
                     continue
                 try:
@@ -351,9 +289,9 @@ class ScheduledSearchManager:
                             "market_data": market,
                             "timestamp": datetime.now().isoformat(),
                         })
-                except (requests.exceptions.RequestException, ValueError, TypeError, KeyError):
+                except Exception:
                     continue
-                time.sleep(0.2)  # تم تقليص وقت النوم لمنع تجميد الواجهة (UI Freeze)
+                time.sleep(1)
 
             with self._lock:
                 self.last_run = datetime.now()
@@ -365,61 +303,36 @@ class ScheduledSearchManager:
                 self.is_running = False
             return []
 
-    def run_scan(self, products_df: pd.DataFrame, top_n: int = 20) -> List[Dict]:
-        """مسح السوق لأهم المنتجات — عبر ThreadPoolExecutor مع تسجيل أي انهيار في الخيط."""
-
-        def _automation_error_callback(fut: concurrent.futures.Future) -> None:
-            try:
-                fut.result()
-            except Exception as e:
-                logger.error(
-                    "انهيار صامت في خيط الأتمتة (Automation Thread Crash): %s",
-                    e,
-                    exc_info=True,
-                )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(self._run_scan_core, products_df, top_n)
-            future.add_done_callback(_automation_error_callback)
-            return future.result()
-
 
 # ═══════════════════════════════════════════════════════
 #  4. تسجيل في قاعدة البيانات
 # ═══════════════════════════════════════════════════════
-def _apply_automation_sqlite_pragmas(conn: sqlite3.Connection) -> None:
-    """يتوافق مع سياسة الإنتاج: WAL + synchronous=NORMAL + busy_timeout."""
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=30000")
-
-
 def _ensure_automation_table(db=None):
     """إنشاء جدول الأتمتة إذا لم يكن موجوداً"""
     path = db or DB_PATH
     try:
-        with sqlite3.connect(path, check_same_thread=False, timeout=30.0) as conn:
-            _apply_automation_sqlite_pragmas(conn)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS automation_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT DEFAULT (datetime('now','localtime')),
-                    product_name TEXT,
-                    product_id TEXT,
-                    rule_name TEXT,
-                    action TEXT,
-                    old_price REAL,
-                    new_price REAL,
-                    comp_price REAL,
-                    competitor TEXT,
-                    match_score REAL,
-                    reason TEXT,
-                    pushed_to_make INTEGER DEFAULT 0
-                )
-            """)
-            conn.commit()
-    except sqlite3.Error as e:
-        logger.warning("automation: ensure table failed path=%r: %s", path, e)
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS automation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT DEFAULT (datetime('now','localtime')),
+                product_name TEXT,
+                product_id TEXT,
+                rule_name TEXT,
+                action TEXT,
+                old_price REAL,
+                new_price REAL,
+                comp_price REAL,
+                competitor TEXT,
+                match_score REAL,
+                reason TEXT,
+                pushed_to_make INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def log_automation_decision(decision: dict, pushed: bool = False, db=None):
@@ -427,125 +340,65 @@ def log_automation_decision(decision: dict, pushed: bool = False, db=None):
     path = db or DB_PATH
     _ensure_automation_table(path)
     try:
-        with sqlite3.connect(path, check_same_thread=False, timeout=30.0) as conn:
-            _apply_automation_sqlite_pragmas(conn)
-            conn.execute(
-                """INSERT INTO automation_log
-                   (product_name, product_id, rule_name, action, old_price,
-                    new_price, comp_price, competitor, match_score, reason, pushed_to_make)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (decision.get("product_name", ""), decision.get("product_id", ""),
-                 decision.get("rule", ""), decision.get("action", ""),
-                 decision.get("old_price", 0), decision.get("new_price", 0),
-                 decision.get("comp_price", 0), decision.get("competitor", ""),
-                 decision.get("match_score", 0), decision.get("reason", ""),
-                 1 if pushed else 0)
-            )
-            conn.commit()
-    except sqlite3.Error as e:
-        logger.warning("automation: log decision failed path=%r: %s", path, e)
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.execute(
+            """INSERT INTO automation_log
+               (product_name, product_id, rule_name, action, old_price,
+                new_price, comp_price, competitor, match_score, reason, pushed_to_make)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (decision.get("product_name", ""), decision.get("product_id", ""),
+             decision.get("rule", ""), decision.get("action", ""),
+             decision.get("old_price", 0), decision.get("new_price", 0),
+             decision.get("comp_price", 0), decision.get("competitor", ""),
+             decision.get("match_score", 0), decision.get("reason", ""),
+             1 if pushed else 0)
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def get_automation_log(limit: int = 50, db=None) -> List[Dict]:
     """استرجاع سجل الأتمتة"""
     path = db or DB_PATH
     _ensure_automation_table(path)
-    conn = None
     try:
-        conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
-        _apply_automation_sqlite_pragmas(conn)
+        conn = sqlite3.connect(path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM automation_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
+        conn.close()
         return [dict(r) for r in rows]
-    except sqlite3.Error as e:
-        logger.warning("automation: get log failed path=%r: %s", path, e)
+    except Exception:
         return []
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                logger.debug("automation: conn.close failed after get_automation_log", exc_info=True)
 
 
 def get_automation_stats(days: int = 7, db=None) -> Dict:
-    """إحصائيات الأتمتة لآخر X يوم — من SQLite مع مراجعة وتأثير مالي."""
+    """إحصائيات الأتمتة لآخر X يوم"""
     path = db or DB_PATH
     _ensure_automation_table(path)
-    conn = None
     try:
-        conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
-        _apply_automation_sqlite_pragmas(conn)
+        conn = sqlite3.connect(path, check_same_thread=False)
         since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         total = conn.execute(
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=?", (since,)
         ).fetchone()[0]
         lower = conn.execute(
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND action='lower_price'",
-            (since,),
+            (since,)
         ).fetchone()[0]
         raised = conn.execute(
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND action='raise_price'",
-            (since,),
-        ).fetchone()[0]
-        keep = conn.execute(
-            "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND action='keep_price'",
-            (since,),
-        ).fetchone()[0]
-        review = conn.execute(
-            "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND action='review'",
-            (since,),
+            (since,)
         ).fetchone()[0]
         pushed = conn.execute(
             "SELECT COUNT(*) FROM automation_log WHERE timestamp>=? AND pushed_to_make=1",
-            (since,),
+            (since,)
         ).fetchone()[0]
-        savings = float(
-            conn.execute(
-                """SELECT COALESCE(SUM(old_price - new_price), 0) FROM automation_log
-                   WHERE timestamp>=? AND action='lower_price'""",
-                (since,),
-            ).fetchone()[0]
-            or 0
-        )
-        gains = float(
-            conn.execute(
-                """SELECT COALESCE(SUM(new_price - old_price), 0) FROM automation_log
-                   WHERE timestamp>=? AND action='raise_price'""",
-                (since,),
-            ).fetchone()[0]
-            or 0
-        )
-        net_impact = round(gains - savings, 2)
-        return {
-            "total": total,
-            "lower": lower,
-            "raise": raised,
-            "keep": keep,
-            "review": review,
-            "pushed": pushed,
-            "savings": round(savings, 2),
-            "gains": round(gains, 2),
-            "net_impact": net_impact,
-        }
-    except sqlite3.Error as e:
-        logger.warning("automation: get stats failed path=%r: %s", path, e)
-        return {
-            "total": 0,
-            "lower": 0,
-            "raise": 0,
-            "keep": 0,
-            "review": 0,
-            "pushed": 0,
-            "savings": 0.0,
-            "gains": 0.0,
-            "net_impact": 0.0,
-        }
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                logger.debug("automation: conn.close failed after get_automation_stats", exc_info=True)
+        conn.close()
+        return {"total": total, "lower": lower, "raise": raised,
+                "keep": total - lower - raised, "pushed": pushed}
+    except Exception:
+        return {"total": 0, "lower": 0, "raise": 0, "keep": 0, "pushed": 0}
